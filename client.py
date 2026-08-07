@@ -6,7 +6,7 @@ UniVPN 开源客户端 — 自动选最优网关 + TUN 模式
   1. sudo python3 client.py               # 启动 VPN（自动认证 + 选最快网关）
   2. dae 分流内网段到 cnem0 / 浏览器直接访问内网 IP
 """
-import socket, ssl, struct, json, sys, os, time, threading, select, fcntl, subprocess, ipaddress, logging, re
+import socket, ssl, struct, json, sys, os, time, threading, select, fcntl, subprocess, ipaddress, logging, re, signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import load_config, setup_wizard
 
@@ -262,6 +262,16 @@ def main():
     if os.geteuid() != 0:
         print("需要 root 权限 (TUN)")
         sys.exit(1)
+
+    # SIGTERM/SIGINT 优雅退出（systemd stop 时执行 finally 恢复 DNS/清理 TUN）
+    stop_event = threading.Event()
+
+    def _handle_signal(signum, frame):
+        logger.info("收到信号 %s，正在退出...", signum)
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
 
     config = load_config()
     if not config["gateways"]:
@@ -528,8 +538,13 @@ def main():
     t3.start()
 
     try:
-        while t1.is_alive() and t2.is_alive():
+        while t1.is_alive() and t2.is_alive() and not stop_event.is_set():
             time.sleep(0.5)
+        # 收到退出信号后，等待转发线程结束（最多 3 秒）
+        if stop_event.is_set():
+            running = False
+            t1.join(timeout=3)
+            t2.join(timeout=3)
     except KeyboardInterrupt:
         pass
     finally:

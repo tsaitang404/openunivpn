@@ -13,11 +13,10 @@ SyslogIdentifier=openunivpn
 ExecStart=/usr/bin/python3 /opt/openunivpn/client.py
 Restart=on-failure
 RestartSec=10
-# 清理 TUN 设备（与 client.py 默认 tun name 一致；改 tun name 时需同步修改）
-ExecStopPost=/usr/bin/ip link del cnem0 2>/dev/null
-# 安全加固
+# 清理 TUN 设备（"-" 前缀忽略失败；systemd 不支持 shell 重定向）
+ExecStopPost=-/usr/bin/ip link del cnem0
+# 安全加固（需写 /etc/resolv.conf 管理 VPN DNS，不能启用 ProtectSystem=full）
 PrivateTmp=true
-ProtectSystem=full
 
 [Install]
 WantedBy=multi-user.target
