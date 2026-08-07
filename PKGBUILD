@@ -6,7 +6,7 @@ pkgdesc="H3C SecPath SSLVPN 开源替代客户端"
 arch=('any')
 url="https://github.com/tsaitang404/openunivpn"
 license=('MIT')
-depends=('python>=3.8')
+depends=('python>=3.8' 'openresolv')
 makedepends=('git')
 source=("${pkgname}::git+${url}.git#tag=v${pkgver}")
 sha256sums=('SKIP')
