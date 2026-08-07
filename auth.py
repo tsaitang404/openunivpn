@@ -58,21 +58,34 @@ class H3CUniVPNAuth:
         print(f"[{self.gateway}] 认证...")
         status, _, _, location = self._request("GET", "/login.html")
         if location and "CsrfTk=" in location:
-            self.csrf_tk = re.search(r"CsrfTk=([^&]+)", location).group(1)
+            m = re.search(r"CsrfTk=([^&]+)", location)
+            if m:
+                self.csrf_tk = m.group(1)
 
         form = urllib.parse.urlencode({
             "UserName": self.username, "Password": self.password,
             "MacAddress": "FFFF-FFFF-FFFF", "SVN_Seco_AaA": "1",
             "SelectLanguage": "0", "VerificationCode": "", "VerificationCodeId": "", "aaa": "1",
         })
-        status, _, _, location = self._request(
+        status, headers, body, location = self._request(
             "POST", "/login.html",
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             body=form,
         )
         if location and "main.html" in location:
+            if not self.user_id or not self.session_id:
+                print(f"  ✗ 登录成功但未提取到 UserID/SessionID（Cookie 格式可能变更）")
+                return False
             print(f"  ✓ UserID={self.user_id}")
             return True
+        # 判断登录失败原因
+        body_str = body.decode("utf-8", errors="replace")
+        if "密码不正确" in body_str or "password" in body_str.lower():
+            print(f"  ✗ 密码错误")
+        elif "用户不存在" in body_str or "user" in body_str.lower():
+            print(f"  ✗ 用户不存在")
+        else:
+            print(f"  ✗ 登录失败 (HTTP {status})")
         return False
 
     def get_session(self):
