@@ -9,7 +9,7 @@ Type=simple
 User=root
 Group=root
 SyslogIdentifier=openunivpn
-ExecStartPre=/usr/bin/python3 /opt/openunivpn/auth.py
+# client.py 内部已完成认证（NetExtension + 双连接握手），无需 ExecStartPre
 ExecStart=/usr/bin/python3 /opt/openunivpn/client.py
 Restart=on-failure
 RestartSec=10
