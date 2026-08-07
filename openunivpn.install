@@ -3,7 +3,7 @@ post_install() {
 OpenUniVPN 已安装
 
 用法:
-  python3 /opt/openunivpn/auth.py          # 首次运行进入配置向导
+  编辑 /etc/openunivpn/config.conf 填入用户名、密码和网关列表
   sudo python3 /opt/openunivpn/client.py    # 启动 VPN (TUN 模式)
 
 或使用 systemd 自动管理:

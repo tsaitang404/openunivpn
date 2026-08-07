@@ -44,13 +44,8 @@ name = cnem0
 
 ### 首次配置
 
-直接运行客户端会进入交互式向导（仅交互式终端；systemd 下会立即失败）：
-
-```bash
-python3 /opt/openunivpn/auth.py
-```
-
-或手动编辑 `/etc/openunivpn/config.conf`（系统级）或 `~/.config/openunivpn/config.conf`（用户级）。建议权限设为 `600`（含明文密码）：
+手动编辑 `/etc/openunivpn/config.conf`（系统级）或 `~/.config/openunivpn/config.conf`（用户级），
+填入用户名、密码和网关列表。建议权限设为 `600`（含明文密码）：
 
 ```bash
 sudo chmod 600 /etc/openunivpn/config.conf
@@ -59,7 +54,6 @@ sudo chmod 600 /etc/openunivpn/config.conf
 ## 使用
 
 ```bash
-python3 /opt/openunivpn/auth.py          # Web 认证（HTTPS 登录 → 保存会话）
 sudo python3 /opt/openunivpn/client.py   # 启动 VPN（自动选最快网关 + TUN 模式）
 ```
 
@@ -78,7 +72,6 @@ sudo journalctl -u openunivpn -f          # 跟踪日志
 ~/.config/openunivpn/config.conf         # 用户级配置
 ~/.local/share/openunivpn/session.json   # 会话缓存（含 UserID/SessionID）
 /opt/openunivpn/
-├── auth.py                              # Web 认证
 ├── client.py                            # VPN 客户端（CNEM 协议 + TUN 转发）
 ├── config.py                            # 配置加载 + 交互式向导
 └── protocol-format.md                   # 协议逆向文档

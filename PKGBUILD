@@ -16,7 +16,7 @@ package() {
     cd "$srcdir/$pkgname"
 
     # 主程序
-    install -Dm644 auth.py client.py config.py protocol-format.md README.md -t "$pkgdir/opt/$pkgname/"
+    install -Dm644 client.py config.py protocol-format.md README.md -t "$pkgdir/opt/$pkgname/"
 
     # systemd service
     install -Dm644 openunivpn.service -t "$pkgdir/usr/lib/systemd/system/"

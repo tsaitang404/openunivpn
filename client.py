@@ -3,13 +3,12 @@
 UniVPN 开源客户端 — 自动选最优网关 + TUN 模式
 
 用法:
-  1. python3 auth.py                     # Web 认证
-  2. sudo python3 client.py              # 启动 VPN (自动选最快网关)
-  3. dae 分流内网段到 cnem0 / 浏览器直接访问内网 IP
+  1. sudo python3 client.py               # 启动 VPN（自动认证 + 选最快网关）
+  2. dae 分流内网段到 cnem0 / 浏览器直接访问内网 IP
 """
 import socket, ssl, struct, json, sys, os, time, threading, select, fcntl, subprocess, ipaddress, logging, re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from config import load_config, setup_wizard, SESSION_FILE, DATA_DIR
+from config import load_config, setup_wizard
 
 logger = logging.getLogger('openunivpn')
 
@@ -219,13 +218,8 @@ def main():
             sys.exit(1)
         config = load_config()
 
-    if not os.path.exists(SESSION_FILE):
-        print("[!] 无会话, 请先运行: python3 auth.py")
-        sys.exit(1)
-
-    with open(SESSION_FILE) as f:
-        sess = json.load(f)
-    ctx1f4 = int(sess["user_id"])
+    # 注：ctx1f4 初始值不重要，NetExtension 认证后会覆盖为认证 UserID
+    ctx1f4 = 0
     gateways = config["gateways"]
     tun_name = config["tun_name"]
 
