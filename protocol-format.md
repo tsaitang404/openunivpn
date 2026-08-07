@@ -6,6 +6,32 @@
 
 ---
 
+## 0.1 🎉 2026-08-07 最终突破：数据面打通（MITM + gdb 验证）
+
+通过 **TLS MITM 代理**（iptables DNAT + 自签证书）捕获 univpn 完整明文帧，
+配合 **gdb 附加 UniVPNCS** 在数据帧构造函数（0xd35ca）/发送函数（0xe4b59）断点验证，
+**openunivpn 已完整实现协议并打通数据面**（DNS 查询经隧道正常解析）。
+
+### 完整连接结构（双连接）
+```
+连接A（主连接 fd=12）: 握手帧(0x001D) → ACL → REQVIP → UDP_AVAILABLE → DATA_CONNECT → UDP_DETECT → DATA
+连接B（HTTP 认证短连接）: GET /netextension/netextensionlogin.html → 166B（认证UserID + 44字符base64隧道密钥）
+UDP socket（fd=14）: connect 到网关:4433（不发数据也需建立，数据面激活需要）
+```
+
+### 关键细节
+1. **握手帧 cmd=0x001D**（340B）：`magic + session + ctx=0 + 001d + 0144 + [Linux64@0 + 网关域名@64 + 01 00 00@320]`
+   → 网关回 792B（协商 ctx=0x00ffffff，payload 全零）
+2. **HTTP 认证必须在独立连接**（同连接会 Broken pipe），响应 `f0f0f0f0 + UserID + ... + 00002c00 + base64密钥(44B)`
+3. **CNEM 握手 ctx 用认证 UserID**（不是 /login.html 的 UserID）
+4. **数据帧**：`magic + session + ctx(认证UserID) + 0002 + len + 明文IP包`（无加密、无 seq）
+5. **数据面只接受允许路由内的目标**：REQVIP 下发的 43 条路由才是可访问的；
+   测试 10.11.8.2 会触发 KICKOUT（cmd=0x0008），用 172.16.1.3（DNS1）正常
+6. **心跳帧 ctx 也用认证 UserID**
+7. 网关对**同会话并发 TLS 连接**敏感（探测阶段裸 TLS 会触发 KICKOUT）
+
+---
+
 ## 0. 关键结论更新（对比上一版报告）
 
 1. **VIP 不是 DHCP 获取**（对当前网关 szvpn/bjvpn）。日志证据：
