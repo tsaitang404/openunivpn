@@ -6,20 +6,18 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/openunivpn/client.py
-ExecStartPre=/usr/bin/python3 /opt/openunivpn/auth.py
-Restart=on-failure
-RestartSec=10
-# TUN 需要 root
 User=root
 Group=root
-# 清理 TUN 设备
+SyslogIdentifier=openunivpn
+ExecStartPre=/usr/bin/python3 /opt/openunivpn/auth.py
+ExecStart=/usr/bin/python3 /opt/openunivpn/client.py
+Restart=on-failure
+RestartSec=10
+# 清理 TUN 设备（与 client.py 默认 tun name 一致；改 tun name 时需同步修改）
 ExecStopPost=/usr/bin/ip link del cnem0 2>/dev/null
 # 安全加固
 PrivateTmp=true
-NoNewPrivileges=false
 ProtectSystem=full
-ProtectHome=false
 
 [Install]
 WantedBy=multi-user.target
