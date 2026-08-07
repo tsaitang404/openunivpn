@@ -7,22 +7,26 @@ UniVPN 开源客户端 — 自动选最优网关 + TUN 模式
   2. sudo python3 client.py              # 启动 VPN (自动选最快网关)
   3. dae 分流内网段到 cnem0 / 浏览器直接访问内网 IP
 """
-import socket, ssl, struct, json, sys, os, time, threading, select, fcntl, subprocess, ipaddress, logging
+import socket, ssl, struct, json, sys, os, time, threading, select, fcntl, subprocess, ipaddress, logging, re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import load_config, setup_wizard, SESSION_FILE, DATA_DIR
 
 logger = logging.getLogger('openunivpn')
 
 # ── CNEM 协议常量 ──────────────────────────────────────
-# 详见 protocol-format.md
-# 命令分发表（HTML 报告 §3.3，二进制偏移 0x458aa8）：
-#   0x02 数据帧, 0x03 REQVIP, 0x05 REQVIP V1, 0x06 UdpPort 响应,
-#   0x07 V1 UDP 探测, 0x0d UDP_AVAILABLE, 0x1a DATA_CONNECT
+# 详见 protocol-format.md + MITM 实测（2026-08-07）
+# 完整握手序列（MITM 捕获，bjvpn.canway.net）：
+#   ACL(0x0006,plen4) → REQVIP(0x0003,plen0) → UDP_AVAILABLE(0x000D,plen4=4)
+#   → DATA_CONNECT(0x001A,plen4=4) → UDP探测(0x0010,plen0) → DATA(0x0002)
 CNEM_MAGIC = 0xBEEFFCFE
 CNEM_SESSION = 0xD6A492C1
-CMD_ACL = 0x0006         # §3.2 ACL 请求（连接后第 1 帧）
-CMD_REQVIP = 0x0003      # REQVIP 请求（GmAlgorithm=0 当前网关，载荷长度=0；2026-08-07 最终验证）
-CMD_DATA = 0x0002
+CMD_ACL = 0x0006         # ACL 请求（连接后第 2 帧）
+CMD_HANDSHAKE = 0x001D   # 连接握手帧（连接后第 1 帧，340B：Linux64+网关域名，ctx=0）
+CMD_REQVIP = 0x0003      # REQVIP 请求（无载荷）
+CMD_UDP_AVAILABLE = 0x000D  # UDP_AVAILABLE（REQVIP 后，plen=4 payload=4）
+CMD_DATA_CONNECT = 0x001A   # DATA_CONNECT（plen=4 payload=4，网关回 UdpPort）
+CMD_UDP_DETECT = 0x0010     # UDP 探测（plen=0）
+CMD_DATA = 0x0002        # 数据帧
 CMD_KEEPALIVE = 0x0005
 
 # 心跳参数
@@ -236,7 +240,82 @@ def main():
     sock = ssl_ctx.wrap_socket(raw, server_hostname=host)
     sock.settimeout(30)
 
-    # 1. ACL（连接后第 1 帧，20B：16B 头 + 4B ctx+0x1f8）
+    # ── 完整握手（双连接，MITM 实测 2026-08-07）──
+    #   连接A（主连接）: 握手帧(0x001D) → ACL → REQVIP → UA → DC → UD → DATA
+    #   连接B（认证连接）: HTTP /netextension 认证 → 166B（UserID + 隧道密钥）
+    #   注意：HTTP 认证必须在独立连接（同连接会 Broken pipe）
+    #   数据面还需 UDP socket connect 到网关:4433（模拟 univpn fd=14）
+
+    username = config["username"]
+    password = config["password"]
+
+    # 0. 连接A 握手帧（cmd=0x001D，340B：Linux64 + 网关域名，ctx=0）
+    handshake_payload = bytearray(324)
+    handshake_payload[0:7] = b"Linux64"
+    domain_b = host.encode()
+    handshake_payload[64:64 + len(domain_b)] = domain_b
+    handshake_payload[320:323] = b"\x01\x00\x00"
+    sock.sendall(cnem_frame(CMD_HANDSHAKE, payload=bytes(handshake_payload), ctx1f4=0))
+    try:
+        sock.settimeout(3)
+        hs_resp = sock.recv(65536)
+        if hs_resp:
+            hs_cmd, _, _ = parse_cnem(hs_resp)
+            logger.info("握手帧响应 cmd=0x%04x (%dB)", hs_cmd or 0, len(hs_resp))
+    except socket.timeout:
+        logger.warning("握手帧无响应")
+    except Exception:
+        pass
+    sock.settimeout(30)
+
+    # 0.5 连接B：HTTP NetExtension 认证（独立连接）
+    if username and password:
+        try:
+            auth_ctx = ssl.create_default_context()
+            auth_ctx.check_hostname = False
+            auth_ctx.verify_mode = ssl.CERT_NONE
+            auth_sock = auth_ctx.wrap_socket(
+                socket.create_connection((ip, 4433), timeout=10), server_hostname=host)
+            pwd_enc = password.replace("%", "%25")
+            path = (f"/netextension/netextensionlogin.html?"
+                    f"SelectLanguage=0&UserName={username}&Password={pwd_enc}"
+                    f"&MacAddress=F04B-B3B9-EBE5&SVN_Seco_AaA=1&")
+            http_req = (f"GET {path} HTTP/1.1\r\n"
+                        "Accept: image/gif, image/x-xbitmap, image/jpeg, image/pjpeg, application/msword, application/vnd.ms-excel, application/vnd.ms-powerpoint, */*\r\n"
+                        "Accept-Language: zh-cn\r\n"
+                        "Accept-Encoding: gzip, deflate\r\n"
+                        "User-Agent: Mozilla/4.0 (compatible; MSIE 6.0; NT 5.1; SV1; .NET CLR 2.0.50727)OS=Linux64\r\n"
+                        f"Host: {host}\r\n"
+                        "\r\n").encode()
+            auth_sock.sendall(http_req)
+            auth_sock.settimeout(5)
+            auth_resp = auth_sock.recv(65536)
+            auth_sock.close()
+            if auth_resp[:4] == b"\xf0\xf0\xf0\xf0":
+                new_uid = struct.unpack(">I", auth_resp[4:8])[0]
+                ctx1f4 = new_uid  # 用认证 UserID 作为 CNEM ctx
+                m = re.search(rb"[A-Za-z0-9+/=]{44}", auth_resp)
+                if m:
+                    logger.info("NetExtension 认证成功 UserID=0x%08x 密钥len=%d", new_uid, len(m.group(0)))
+                else:
+                    logger.info("NetExtension 认证成功 UserID=0x%08x", new_uid)
+            else:
+                logger.warning("NetExtension 认证失败 (%dB)", len(auth_resp))
+                sys.exit(1)
+        except Exception as e:
+            logger.error("NetExtension 认证异常: %s", e)
+            sys.exit(1)
+
+    # 0.6 UDP socket connect 到网关:4433（模拟 univpn fd=14，数据面激活需要）
+    udp_probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        udp_probe.connect((ip, 4433))
+        udp_probe.settimeout(2)
+        logger.info("UDP socket 已 connect %s:4433", ip)
+    except Exception as e:
+        logger.warning("UDP connect 失败: %s", e)
+
+    # 1. ACL（连接A，20B：16B 头 + 4B ctx+0x1f8）
     sock.sendall(cnem_frame(CMD_ACL, extra_be32=0, ctx1f4=ctx1f4))
     acl_resp = b""
     try:
@@ -282,6 +361,39 @@ def main():
         print("[!] REQVIP 响应解析失败，无法继续")
         sys.exit(1)
 
+    # 3. UDP_AVAILABLE → DATA_CONNECT → UDP 探测（MITM 实测必须）
+    for cmd_val, payload in (
+        (CMD_UDP_AVAILABLE, struct.pack(">I", 4)),
+        (CMD_DATA_CONNECT, struct.pack(">I", 4)),
+    ):
+        sock.sendall(cnem_frame(cmd_val, payload=payload, ctx1f4=ctx1f4))
+        logger.info("已发送 cmd=0x%04x", cmd_val)
+        try:
+            sock.settimeout(2)
+            r = sock.recv(65536)
+            if r:
+                rcmd, rpl, _ = parse_cnem(r)
+                logger.info("  响应 cmd=0x%04x payload=%s", rcmd or 0, (rpl or b"").hex()[:32])
+        except socket.timeout:
+            logger.warning("  cmd=0x%04x 无响应", cmd_val)
+        except Exception:
+            pass
+        sock.settimeout(30)
+
+    # UDP 探测帧（0x0010，无载荷）——发 TLS + UDP socket
+    time.sleep(1)
+    sock.sendall(cnem_frame(CMD_UDP_DETECT, ctx1f4=ctx1f4))
+    logger.info("已发送 UDP 探测 cmd=0x0010")
+    # UDP socket 也发一帧探测（HTML §7 格式）
+    try:
+        udp_detect = (struct.pack("<I", 0xBEEFFCFE) + bytes.fromhex("c192a4d6")
+                      + struct.pack("<I", 0x1000021c) + struct.pack(">I", ctx1f4)
+                      + os.urandom(13))
+        udp_probe.sendto(udp_detect, (ip, 4433))
+        logger.info("UDP 探测帧 %dB 已发送", len(udp_detect))
+    except Exception:
+        pass
+
     # ── TUN 配置 ──
     tun_fd, tun_name = create_tun(tun_name)
     run_cmd(["ip", "link", "set", tun_name, "up"])
@@ -315,8 +427,10 @@ def main():
             time.sleep(KEEPALIVE_CHECK_INTERVAL)
             if time.time() - last_keepalive >= KEEPALIVE_IDLE_TIMEOUT:
                 try:
+                    # 心跳帧 ctx 必须是认证 UserID（不能用 0）
+                    keepalive_frame = cnem_frame(CMD_KEEPALIVE, ctx1f4=ctx1f4)
                     with sock_lock:
-                        sock.sendall(KEEPALIVE_FRAME)
+                        sock.sendall(keepalive_frame)
                     last_keepalive = time.time()
                 except Exception:
                     break
