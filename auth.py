@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """OpenUniVPN Web 认证 — 自动尝试所有网关, 保存会话"""
 
-import http.client, ssl, re, json, sys, os, urllib.parse
+import http.client, ssl, re, json, sys, os, urllib.parse, logging
 from config import load_config, setup_wizard, SESSION_FILE, DATA_DIR
+
+logger = logging.getLogger('openunivpn')
 
 
 class H3CUniVPNAuth:
@@ -55,7 +57,7 @@ class H3CUniVPNAuth:
         return "; ".join(f"{k}={v}" for k, v in self.cookies.items())
 
     def login(self):
-        print(f"[{self.gateway}] 认证...")
+        logger.info("[%s] 认证...", self.gateway)
         status, _, _, location = self._request("GET", "/login.html")
         if location and "CsrfTk=" in location:
             m = re.search(r"CsrfTk=([^&]+)", location)
@@ -74,18 +76,19 @@ class H3CUniVPNAuth:
         )
         if location and "main.html" in location:
             if not self.user_id or not self.session_id:
-                print(f"  ✗ 登录成功但未提取到 UserID/SessionID（Cookie 格式可能变更）")
+                logger.warning("[%s] 登录成功但未提取到 UserID/SessionID（Cookie 格式可能变更）",
+                               self.gateway)
                 return False
-            print(f"  ✓ UserID={self.user_id}")
+            logger.info("[%s] ✓ UserID=%s", self.gateway, self.user_id)
             return True
         # 判断登录失败原因
         body_str = body.decode("utf-8", errors="replace")
         if "密码不正确" in body_str or "password" in body_str.lower():
-            print(f"  ✗ 密码错误")
+            logger.warning("[%s] ✗ 密码错误", self.gateway)
         elif "用户不存在" in body_str or "user" in body_str.lower():
-            print(f"  ✗ 用户不存在")
+            logger.warning("[%s] ✗ 用户不存在", self.gateway)
         else:
-            print(f"  ✗ 登录失败 (HTTP {status})")
+            logger.warning("[%s] ✗ 登录失败 (HTTP %s)", self.gateway, status)
         return False
 
     def get_session(self):
@@ -97,12 +100,18 @@ class H3CUniVPNAuth:
 
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+    )
+
     config = load_config()
     username = config['username']
     password = config['password']
     gateways = config['gateways']
 
     if not gateways:
+        # systemd 非交互环境下 setup_wizard 会立即返回 False
         print("[!] 未配置, 进入设置向导...\n")
         if not setup_wizard():
             sys.exit(1)
@@ -116,14 +125,16 @@ def main():
         try:
             if auth.login():
                 os.makedirs(DATA_DIR, exist_ok=True)
+                # session.json 含 UserID/SessionID，等价于会话凭据，限制权限
                 with open(SESSION_FILE, "w") as f:
                     json.dump(auth.get_session(), f, indent=2)
+                os.chmod(SESSION_FILE, 0o600)
                 print(f"\n会话已保存 ({host})")
                 return 0
         except Exception as e:
-            print(f"  ✗ {e}")
+            logger.warning("[%s] ✗ %s", host, e)
 
-    print("[!] 所有网关认证失败")
+    logger.error("所有网关认证失败")
     return 1
 
 

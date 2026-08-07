@@ -9,6 +9,7 @@
 """
 
 import os
+import sys
 import configparser
 
 USER_CONFIG = os.path.expanduser('~/.config/openunivpn/config.conf')
@@ -59,8 +60,16 @@ def load_config():
 
 
 def setup_wizard():
-    """交互式配置向导"""
-    import shutil
+    """交互式配置向导
+
+    在非交互环境（systemd、CI、管道输入）下立即返回 False，
+    避免挂起等待终端输入。
+    """
+    # 检测 stdin 是否为交互式终端
+    if not sys.stdin.isatty():
+        print("[!] 非交互环境，无法运行配置向导。", file=sys.stderr)
+        print(f"    请手动编辑 {USER_CONFIG} 或 {SYSTEM_CONFIG}", file=sys.stderr)
+        return False
 
     os.makedirs(os.path.dirname(USER_CONFIG), exist_ok=True)
 
@@ -77,14 +86,16 @@ def setup_wizard():
         line = input(f"  网关 #{len(gateways)+1}: ").strip()
         if not line:
             break
-        if ':' in line:
-            gateways.append(line)
+        if ':' not in line:
+            print(f"  [!] 格式错误，应为 host:ip（缺少冒号），已跳过: {line}")
+            continue
+        gateways.append(line)
 
     if not gateways:
         print("[!] 至少需要一个网关")
         return False
 
-    # 写入配置
+    # 写入配置（含明文密码，文件权限设为仅属主可读写）
     c = configparser.RawConfigParser()
     c['auth'] = {'username': username, 'password': password}
     c['gateway'] = {'list': ','.join(gateways)}
@@ -92,15 +103,10 @@ def setup_wizard():
 
     with open(USER_CONFIG, 'w') as f:
         c.write(f)
+    os.chmod(USER_CONFIG, 0o600)
 
     # 创建数据目录
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    # 也写一份 .env.example 模板
-    example = os.path.join(os.path.dirname(USER_CONFIG), 'config.example.conf')
-    if not os.path.exists(example):
-        shutil.copy(USER_CONFIG, example)
-        print(f"\n配置模板: {example}")
-
-    print(f"\n✓ 配置已保存: {USER_CONFIG}")
+    print(f"\n✓ 配置已保存: {USER_CONFIG} (权限 600)")
     return True
