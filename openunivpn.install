@@ -1,4 +1,33 @@
 post_install() {
+    # 自动配置 NetworkManager 使用 openresolv（rc-manager=resolvconf）
+    # openunivpn 的 DNS 管理依赖此配置；幂等，已配置则跳过
+    NM_CONF="/etc/NetworkManager/NetworkManager.conf"
+    if [ -f "$NM_CONF" ] && ! grep -q "rc-manager=resolvconf" "$NM_CONF" 2>/dev/null; then
+        # 去掉可能存在的 dns=none（openunivpn 早期版本方案），改用 rc-manager=resolvconf
+        sed -i 's/^dns=none$//' "$NM_CONF" 2>/dev/null || true
+        if ! grep -q "^\[main\]" "$NM_CONF" 2>/dev/null; then
+            printf '\n[main]\nrc-manager=resolvconf\n' >> "$NM_CONF"
+        else
+            # 在 [main] 段内插入 rc-manager=resolvconf
+            awk '
+                BEGIN { in_main=0; inserted=0 }
+                /^\[main\]/ { in_main=1; print; next }
+                /^\[/ && !/^\[main\]/ { in_main=0 }
+                {
+                    if (in_main && !inserted) {
+                        print "rc-manager=resolvconf"
+                        inserted=1
+                    }
+                    print
+                }
+                END { if (!inserted && in_main) print "rc-manager=resolvconf" }
+            ' "$NM_CONF" > "${NM_CONF}.tmp" && mv "${NM_CONF}.tmp" "$NM_CONF"
+        fi
+        # 重启 NetworkManager 应用配置（DNS 相关，不影响网络连通）
+        systemctl restart NetworkManager 2>/dev/null || true
+        echo "✓ 已配置 NetworkManager rc-manager=resolvconf（DNS 由 openresolv 管理）"
+    fi
+
     cat << 'EOF'
 OpenUniVPN 已安装
 
@@ -9,6 +38,10 @@ OpenUniVPN 已安装
 或使用 systemd 自动管理:
   sudo systemctl enable --now openunivpn   # 开机自启 + 启动
   sudo systemctl status openunivpn         # 查看状态
+
+DNS 说明:
+  已自动配置 NetworkManager + openresolv，VPN 连接时自动使用内网 DNS，
+  断开时自动恢复。无需手工设置。
 EOF
 }
 
