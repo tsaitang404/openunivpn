@@ -6,7 +6,7 @@ UniVPN 开源客户端 — 自动选最优网关 + TUN 模式
   1. sudo python3 client.py               # 启动 VPN（自动认证 + 选最快网关）
   2. dae 分流内网段到 cnem0 / 浏览器直接访问内网 IP
 """
-import socket, ssl, struct, json, sys, os, time, threading, select, fcntl, subprocess, ipaddress, logging, re, signal
+import socket, ssl, struct, json, sys, os, time, threading, select, fcntl, subprocess, ipaddress, logging, re, signal, shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import load_config, setup_wizard
 
@@ -207,9 +207,17 @@ def run_cmd(args):
 # （两者都走 resolvconf，互不覆盖）。
 RESOLVCONF_IFACE = 'vpn0'
 
+def _resolvconf_available():
+    """resolvconf 是否可用（依赖 openresolv）。缺失时跳过 DNS 注入，避免破坏网络。"""
+    return shutil.which("resolvconf") is not None
+
+
 def setup_dns(vpn_dns_list):
     """把 VPN DNS 通过 resolvconf 加入系统（自动排最前，保留原 DNS fallback）。"""
     if not vpn_dns_list:
+        return
+    if not _resolvconf_available():
+        logger.warning("openresolv(resolvconf) 未安装，跳过 VPN DNS 注入（不影响公网）")
         return
     try:
         content = "\n".join(f"nameserver {d}" for d in vpn_dns_list) + "\n"
@@ -227,6 +235,8 @@ def setup_dns(vpn_dns_list):
 
 def restore_dns():
     """VPN 退出时从 resolvconf 移除 VPN DNS。"""
+    if not _resolvconf_available():
+        return
     try:
         p = subprocess.run(
             ["resolvconf", "-d", RESOLVCONF_IFACE],
@@ -444,7 +454,7 @@ def main():
     for net, mask in vip["routes"]:
         prefix = ipaddress.IPv4Network(f"{net}/{mask}", strict=False).prefixlen
         run_cmd(["ip", "route", "add", f"{net}/{prefix}", "dev", tun_name])
-    for subnet in ["10.11.0.0/16", "10.12.0.0/16", "10.13.0.0/16", "192.168.0.0/16"]:
+    for subnet in ["10.11.0.0/16", "10.12.0.0/16", "10.13.0.0/16"]:
         run_cmd(["ip", "route", "add", subnet, "dev", tun_name])
     if vip["dns"]:
         setup_dns(vip["dns"])
