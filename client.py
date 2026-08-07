@@ -7,30 +7,64 @@ UniVPN 开源客户端 — 自动选最优网关 + TUN 模式
   2. sudo python3 client.py              # 启动 VPN (自动选最快网关)
   3. dae 分流内网段到 cnem0 / 浏览器直接访问内网 IP
 """
-import socket, ssl, struct, json, sys, os, time, threading, select, fcntl, subprocess, ipaddress
+import socket, ssl, struct, json, sys, os, time, threading, select, fcntl, subprocess, ipaddress, logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import load_config, setup_wizard, SESSION_FILE, DATA_DIR
 
+logger = logging.getLogger('openunivpn')
+
+# ── CNEM 协议常量 ──────────────────────────────────────
+# 详见 protocol-format.md
 CNEM_MAGIC = 0xBEEFFCFE
 CNEM_SESSION = 0xD6A492C1
-CMD_ACL = 0x0006
-CMD_REQVIP = 0x0003
+# cmd 字段（帧头偏移 +12，u16 BE）
+CMD_ACL = 0x0006         # §3.2 ACL 请求（连接后第 1 帧）
+CMD_REQVIP = 0x0004      # §3.3 当前网关 (GmAlgorithm=0) 的 REQVIP；V1 网关为 0x0005
 CMD_DATA = 0x0002
 CMD_KEEPALIVE = 0x0005
 
-be32 = lambda v: struct.pack(">I", v & 0xFFFFFFFF)
-be16 = lambda v: struct.pack(">H", v & 0xFFFF)
+# 心跳参数
+KEEPALIVE_CHECK_INTERVAL = 10   # 检查间隔（秒）
+KEEPALIVE_IDLE_TIMEOUT = 30     # 距上次发包超过此值则发心跳
+
+
+def be32(v):
+    """大端 32 位打包"""
+    return struct.pack(">I", v & 0xFFFFFFFF)
+
+
+def be16(v):
+    """大端 16 位打包"""
+    return struct.pack(">H", v & 0xFFFF)
+
+
 MAGIC_B = struct.pack("<I", CNEM_MAGIC)
 SESS_B = struct.pack("<I", CNEM_SESSION)
 
 KEEPALIVE_FRAME = MAGIC_B + SESS_B + be32(0) + be16(CMD_KEEPALIVE) + be16(0)
 
+
 def cnem_frame(cmd, payload=b"", ctx1f4=0, extra_be32=None):
+    """构造 CNEM 帧（16 字节帧头 + 可选载荷）
+
+    帧格式（详见 protocol-format.md §3.1）：
+      +0   u32 LE  magic
+      +4   u32 LE  session[0..3]
+      +8   u32 BE  ctx1f4 (网络字节序)
+      +12  u16 BE  cmd
+      +14  u16 BE  payload 长度
+      +16  ...     payload
+    """
     if extra_be32 is not None:
         payload = payload + be32(extra_be32)
     return MAGIC_B + SESS_B + be32(ctx1f4) + be16(cmd) + be16(len(payload)) + payload
 
+
 def parse_cnem(data):
+    """解析 CNEM 帧，返回 (cmd, payload, remaining)。
+
+    若数据不完整返回 (None, None, 原始 data)，由调用方继续缓冲。
+    """
     if len(data) < 16:
         return None, None, data
     cmd = struct.unpack(">H", data[12:14])[0]
@@ -47,8 +81,14 @@ def _parse_ip(b):
     return ".".join(str(x) for x in b)
 
 def parse_netcfg(payload):
-    """从 REQVIP 响应载荷中提取 VIP/掩码/DNS/路由，基于日志中的字段偏移"""
+    """从 REQVIP 响应载荷中提取 VIP/掩码/DNS/路由。
+
+    ⚠ 启发式解析：偏移基于 2026-08-06 抓包样本（详见 protocol-format.md §4）。
+    若网关固件升级导致响应结构变化，DNS/路由可能解析失败；这种情况下仍能返回
+    VIP/掩码（前 8 字节，结构稳定），DNS/路由会留空，需要重新抓包校准偏移。
+    """
     if len(payload) < 30:
+        logger.warning("REQVIP 响应过短 (%d 字节)，无法解析", len(payload))
         return None
 
     vip = {
@@ -57,8 +97,11 @@ def parse_netcfg(payload):
         "dns": [],
         "routes": [],
     }
+    logger.debug("REQVIP netcfg 原始载荷长度=%d, VIP=%s mask=%s",
+                 len(payload), vip["vip_ip"], vip["mask"])
 
-    # 从 DNS Server IP Nums 偏移附近扫描：找到第一个非零IP段视为 DNS
+    # DNS：从经验偏移范围扫描，找连续 4 字节可解析为合法 IPv4 的字段。
+    # 实际偏移受 "DNS Server IP Nums" 字段影响，固件不同可能漂移。
     for off in range(0x80, min(len(payload) - 4, 0xC0)):
         if payload[off:off + 2] != b"\x00\x00":
             try:
@@ -69,7 +112,7 @@ def parse_netcfg(payload):
             except Exception:
                 continue
 
-    # 路由表从尾部向前扫描（net/mask 对，以 0xFF 终结）
+    # 路由表：从尾部向前扫描，net/mask 成对（每项 16 字节），以 0xFF...FF 终结
     route_off = min(0xC0, len(payload) - 32)
     while route_off + 16 <= len(payload):
         net_b = payload[route_off:route_off + 4]
@@ -80,6 +123,8 @@ def parse_netcfg(payload):
             vip["routes"].append((_parse_ip(net_b), _parse_ip(mask_b)))
         route_off += 16
 
+    if not vip["dns"]:
+        logger.warning("未能从 REQVIP 响应解析出 DNS（偏移可能已漂移）")
     return vip
 
 
@@ -122,8 +167,8 @@ def probe_gateway(host, ip, ctx1f4):
         return None
 
 
-def select_gateway(sess, gateways):
-    ctx1f4 = int(sess["user_id"])
+def select_gateway(ctx1f4, gateways):
+    """并发探测所有网关，按延迟升序返回最快的一个"""
     print("[*] 探测网关...")
     results = []
     with ThreadPoolExecutor(max_workers=min(len(gateways), 8)) as pool:
@@ -155,6 +200,11 @@ def run_cmd(args):
 
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+    )
+
     if os.geteuid() != 0:
         print("需要 root 权限 (TUN)")
         sys.exit(1)
@@ -176,7 +226,7 @@ def main():
     gateways = config["gateways"]
     tun_name = config["tun_name"]
 
-    vip = select_gateway(sess, gateways)
+    vip = select_gateway(ctx1f4, gateways)
     host, ip = vip["host"], vip["ip"]
 
     # ── TLS 连接 ──
@@ -223,11 +273,16 @@ def main():
     sock_lock = threading.Lock()
 
     def send_keepalive():
-        """每 30s 发送心跳帧，防止网关踢连接"""
+        """每 KEEPALIVE_CHECK_INTERVAL 秒检查一次，距上次发包超过
+        KEEPALIVE_IDLE_TIMEOUT 秒则发送心跳帧，防止网关踢连接。
+
+        注：last_keepalive 由多线程共享读写，依赖 GIL 保证单次赋值的原子性；
+        偶发的"读到稍旧的值"只会导致心跳略延迟，不影响正确性。
+        """
         nonlocal last_keepalive
         while running:
-            time.sleep(10)
-            if time.time() - last_keepalive >= 30:
+            time.sleep(KEEPALIVE_CHECK_INTERVAL)
+            if time.time() - last_keepalive >= KEEPALIVE_IDLE_TIMEOUT:
                 try:
                     with sock_lock:
                         sock.sendall(KEEPALIVE_FRAME)
