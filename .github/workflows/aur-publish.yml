@@ -1,0 +1,30 @@
+name: aur-publish
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.github/**'
+      - 'README.md'
+      - 'LICENSE'
+
+jobs:
+  aur-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update pkgver from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${GITHUB_REF#refs/tags/v}/" PKGBUILD
+          sed -i 's/^pkgrel=.*/pkgrel=1/' PKGBUILD
+
+      - name: Publish to AUR
+        uses: KSYOMEGA/action-aur-publish@v1
+        with:
+          pkgname: openunivpn
+          pkgbuild: ./PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_KEY }}

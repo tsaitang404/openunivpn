@@ -13,11 +13,15 @@ sha256sums=('SKIP')
 install="$pkgname.install"
 
 package() {
-    cd "$srcdir/$pkgname"
+    # 支持本地构建 (makepkg --skipinteg) 和远程构建
+    if [ -d "$srcdir/$pkgname" ]; then
+        cd "$srcdir/$pkgname"
+    else
+        cd "$startdir"
+    fi
 
     # 主程序
     install -Dm644 auth.py client.py config.py protocol-format.md README.md -t "$pkgdir/opt/$pkgname/"
-    install -Dm644 tools/mitm_proxy.py -t "$pkgdir/opt/$pkgname/tools/"
 
     # 系统配置模板
     install -Dm644 /dev/stdin "$pkgdir/etc/$pkgname/config.conf" << 'EOF'
