@@ -15,11 +15,13 @@ logger = logging.getLogger('openunivpn')
 
 # ── CNEM 协议常量 ──────────────────────────────────────
 # 详见 protocol-format.md
+# 命令分发表（HTML 报告 §3.3，二进制偏移 0x458aa8）：
+#   0x02 数据帧, 0x03 REQVIP, 0x05 REQVIP V1, 0x06 UdpPort 响应,
+#   0x07 V1 UDP 探测, 0x0d UDP_AVAILABLE, 0x1a DATA_CONNECT
 CNEM_MAGIC = 0xBEEFFCFE
 CNEM_SESSION = 0xD6A492C1
-# cmd 字段（帧头偏移 +12，u16 BE）
 CMD_ACL = 0x0006         # §3.2 ACL 请求（连接后第 1 帧）
-CMD_REQVIP = 0x0004      # §3.3 当前网关 (GmAlgorithm=0) 的 REQVIP；V1 网关为 0x0005
+CMD_REQVIP = 0x0003      # REQVIP 请求（GmAlgorithm=0 当前网关，载荷长度=0；2026-08-07 最终验证）
 CMD_DATA = 0x0002
 CMD_KEEPALIVE = 0x0005
 
@@ -64,29 +66,47 @@ def parse_cnem(data):
     """解析 CNEM 帧，返回 (cmd, payload, remaining)。
 
     若数据不完整返回 (None, None, 原始 data)，由调用方继续缓冲。
+
+    ⚠ len 字段端序：实测网关响应中 ACL(cmd=0x0006) 用**小端**（`14 00`=20），
+    REQVIP(cmd=0x0003) 用**大端**（`03 bc`=956）。发送方向恒用大端（网关接受）。
+    因此这里对响应帧做自适应：BE/LE 都试，取能恰好覆盖缓冲长度者。
     """
     if len(data) < 16:
         return None, None, data
     cmd = struct.unpack(">H", data[12:14])[0]
-    plen = struct.unpack(">H", data[14:16])[0]
-    if plen > 65535:
-        return None, None, data
-    if len(data) >= 16 + plen:
-        return cmd, data[16:16 + plen], data[16 + plen:]
+    plen_be = struct.unpack(">H", data[14:16])[0]
+    plen_le = struct.unpack("<H", data[14:16])[0]
+    # 优先选能恰好覆盖缓冲的端序；两端序都不完整则返回 None 继续缓冲
+    for plen in sorted({plen_be, plen_le}):
+        if plen <= 65535 and 16 + plen <= len(data):
+            return cmd, data[16:16 + plen], data[16 + plen:]
     return None, None, data
 
 
-# ── REQVIP 载荷解析 ──────────────────────────────────────
+# ── REQVIP 响应解析 ──────────────────────────────────
+# 结构（2026-08-07 实测，bjvpn.canway.net, payload=956B）：
+#   @0   4B  VIP
+#   @4   4B  掩码
+#   @8   4B  保留
+#   ...  中间为随机/加密数据（约 @8-159）
+#   @160 4B  DNS 服务器 1
+#   @164 4B  DNS 服务器 2
+#   @168 16B 零填充
+#   @186 2B  BE 路由数量
+#   @188 ... 路由表，每条 12B：network(4B) + mask(4B) + extra(4B)
+# ⚠ 偏移基于本网关固件实测，若固件升级结构变化需重新校准
+#   （对照 protocol-format.md §4 和 HTML 逆向报告）
+
+NETCFG_DNS_OFF = 0xA0        # 160
+NETCFG_RT_COUNT_OFF = 0xBA   # 186
+NETCFG_RT_START = 0xBC       # 188
+NETCFG_RT_STRIDE = 12
+
 def _parse_ip(b):
     return ".".join(str(x) for x in b)
 
 def parse_netcfg(payload):
-    """从 REQVIP 响应载荷中提取 VIP/掩码/DNS/路由。
-
-    ⚠ 启发式解析：偏移基于 2026-08-06 抓包样本（详见 protocol-format.md §4）。
-    若网关固件升级导致响应结构变化，DNS/路由可能解析失败；这种情况下仍能返回
-    VIP/掩码（前 8 字节，结构稳定），DNS/路由会留空，需要重新抓包校准偏移。
-    """
+    """从 REQVIP 响应载荷中提取 VIP/掩码/DNS/路由（精确偏移解析）。"""
     if len(payload) < 30:
         logger.warning("REQVIP 响应过短 (%d 字节)，无法解析", len(payload))
         return None
@@ -97,78 +117,57 @@ def parse_netcfg(payload):
         "dns": [],
         "routes": [],
     }
-    logger.debug("REQVIP netcfg 原始载荷长度=%d, VIP=%s mask=%s",
+    logger.debug("REQVIP netcfg 载荷=%dB VIP=%s mask=%s",
                  len(payload), vip["vip_ip"], vip["mask"])
 
-    # DNS：从经验偏移范围扫描，找连续 4 字节可解析为合法 IPv4 的字段。
-    # 实际偏移受 "DNS Server IP Nums" 字段影响，固件不同可能漂移。
-    for off in range(0x80, min(len(payload) - 4, 0xC0)):
-        if payload[off:off + 2] != b"\x00\x00":
-            try:
-                candidate = _parse_ip(payload[off:off + 4])
-                ipaddress.IPv4Address(candidate)
-                if candidate not in vip["dns"]:
-                    vip["dns"].append(candidate)
-            except Exception:
-                continue
-
-    # 路由表：从尾部向前扫描，net/mask 成对（每项 16 字节），以 0xFF...FF 终结
-    route_off = min(0xC0, len(payload) - 32)
-    while route_off + 16 <= len(payload):
-        net_b = payload[route_off:route_off + 4]
-        mask_b = payload[route_off + 4:route_off + 8]
-        if net_b == b"\xff\xff\xff\xff":
-            break
-        if net_b != b"\x00\x00\x00\x00":
-            vip["routes"].append((_parse_ip(net_b), _parse_ip(mask_b)))
-        route_off += 16
-
+    # DNS：@160/164 两个连续 IP（跳过 0.0.0.0）
+    for off in (NETCFG_DNS_OFF, NETCFG_DNS_OFF + 4):
+        if off + 4 <= len(payload):
+            candidate = _parse_ip(payload[off:off + 4])
+            if candidate != "0.0.0.0":
+                vip["dns"].append(candidate)
     if not vip["dns"]:
         logger.warning("未能从 REQVIP 响应解析出 DNS（偏移可能已漂移）")
+
+    # 路由表：@188 开始，每条 12B，数量由 @184 给出
+    if NETCFG_RT_COUNT_OFF + 2 <= len(payload):
+        route_count = struct.unpack(">H", payload[NETCFG_RT_COUNT_OFF:NETCFG_RT_COUNT_OFF + 2])[0]
+        off = NETCFG_RT_START
+        for _ in range(route_count):
+            if off + 8 > len(payload):
+                break
+            net_b = payload[off:off + 4]
+            mask_b = payload[off + 4:off + 8]
+            if net_b == b"\x00\x00\x00\x00" and mask_b == b"\x00\x00\x00\x00":
+                break
+            vip["routes"].append((_parse_ip(net_b), _parse_ip(mask_b)))
+            off += NETCFG_RT_STRIDE
+
+    logger.info("REQVIP 解析: VIP=%s mask=%s DNS=%s routes=%d",
+                vip["vip_ip"], vip["mask"], vip["dns"], len(vip["routes"]))
     return vip
 
 
 def probe_gateway(host, ip, ctx1f4):
+    """只测 TCP 连通延迟（不建 TLS、不发业务帧）。
+
+    重要：不能在此建立 TLS 连接或发送任何 CNEM 帧。
+    网关对同一会话的裸 TLS 连接（握手后不发协议帧就关闭）敏感，
+    会判定异常并对后续主连接返回 KICKOUT (cmd=0x0008)。
+    因此探测只做 TCP connect 测延迟，完整握手仅在 main() 中做一次。
+    """
     t0 = time.time()
     try:
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
         raw = socket.create_connection((ip, 4433), timeout=5)
-        s = ssl_ctx.wrap_socket(raw, server_hostname=host)
-        s.settimeout(5)
-        s.sendall(cnem_frame(CMD_ACL, extra_be32=0, ctx1f4=ctx1f4))
-        r = s.recv(4096)
-        if struct.unpack(">H", r[12:14])[0] != CMD_ACL:
-            s.close()
-            return None
-        s.sendall(cnem_frame(CMD_REQVIP, ctx1f4=ctx1f4))
-        buf = b""
-        try:
-            for _ in range(3):
-                d = s.recv(65536)
-                if not d:
-                    break
-                buf += d
-        except Exception:
-            pass
-        s.close()
+        raw.close()
         lat = (time.time() - t0) * 1000
-        if len(buf) < 30:
-            return None
-        _, payload, _ = parse_cnem(buf)
-        if not payload:
-            return None
-        netcfg = parse_netcfg(payload)
-        if not netcfg:
-            return None
-        return {"host": host, "ip": ip, "latency": lat, **netcfg}
+        return {"host": host, "ip": ip, "latency": lat}
     except Exception:
         return None
 
 
 def select_gateway(ctx1f4, gateways):
-    """并发探测所有网关，按延迟升序返回最快的一个"""
+    """并发探测所有网关（仅 TCP/TLS 连通性），按延迟升序返回最快的一个"""
     print("[*] 探测网关...")
     results = []
     with ThreadPoolExecutor(max_workers=min(len(gateways), 8)) as pool:
@@ -182,7 +181,7 @@ def select_gateway(ctx1f4, gateways):
         sys.exit(1)
     results.sort(key=lambda r: r["latency"])
     for r in results:
-        print(f"  {r['host']}: {r['latency']:.0f}ms → VIP={r['vip_ip']}")
+        print(f"  {r['host']}: {r['latency']:.0f}ms")
     return results[0]
 
 
@@ -226,23 +225,37 @@ def main():
     gateways = config["gateways"]
     tun_name = config["tun_name"]
 
-    vip = select_gateway(ctx1f4, gateways)
-    host, ip = vip["host"], vip["ip"]
+    gw = select_gateway(ctx1f4, gateways)
+    host, ip, latency = gw["host"], gw["ip"], gw["latency"]
 
-    # ── TLS 连接 ──
+    # ── TLS 连接 + 完整握手（ACL → REQVIP）──
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
     raw = socket.create_connection((ip, 4433), timeout=15)
     sock = ssl_ctx.wrap_socket(raw, server_hostname=host)
     sock.settimeout(30)
+
+    # 1. ACL（连接后第 1 帧，20B：16B 头 + 4B ctx+0x1f8）
     sock.sendall(cnem_frame(CMD_ACL, extra_be32=0, ctx1f4=ctx1f4))
-    sock.recv(4096)
+    acl_resp = b""
+    try:
+        acl_resp = sock.recv(4096)
+    except Exception:
+        pass
+    logger.info("ACL 响应 %dB: %s", len(acl_resp), acl_resp[:64].hex())
+    acl_cmd, _, _ = parse_cnem(acl_resp)
+    if acl_cmd != CMD_ACL:
+        print(f"[!] ACL 握手失败 (resp cmd=0x{(acl_cmd or 0):04x}, {len(acl_resp)}B)")
+        sys.exit(1)
+    logger.info("ACL 握手成功")
+
+    # 2. REQVIP（16B 帧头，无载荷）
     sock.sendall(cnem_frame(CMD_REQVIP, ctx1f4=ctx1f4))
     buf = b""
     try:
         sock.settimeout(5)
-        for _ in range(3):
+        for _ in range(5):
             d = sock.recv(65536)
             if not d:
                 break
@@ -250,6 +263,24 @@ def main():
     except Exception:
         pass
     sock.settimeout(30)
+
+    # 解析 REQVIP 响应：提取 VIP/掩码/DNS/路由
+    vip = None
+    off = 0
+    while off + 16 <= len(buf):
+        cmd, pl, rest = parse_cnem(buf[off:])
+        if cmd is None:
+            break
+        if cmd == 0x0003 and len(pl) >= 30:
+            vip = parse_netcfg(pl)
+            if vip:
+                logger.info("REQVIP 解析成功: VIP=%s mask=%s", vip["vip_ip"], vip["mask"])
+            break
+        off += 16 + len(pl)
+
+    if not vip:
+        print("[!] REQVIP 响应解析失败，无法继续")
+        sys.exit(1)
 
     # ── TUN 配置 ──
     tun_fd, tun_name = create_tun(tun_name)
@@ -264,7 +295,7 @@ def main():
         with open("/tmp/cnem_resolv.conf", "w") as f:
             f.write(f"nameserver {vip['dns'][0]}\n")
 
-    print(f"\n[*] {host} ({vip['latency']:.0f}ms) VIP={vip['vip_ip']} DNS={vip['dns']}")
+    print(f"\n[*] {host} ({latency:.0f}ms) VIP={vip['vip_ip']} DNS={vip['dns']}")
     print(f"    TUN: {tun_name}  Ctrl+C 停止")
 
     # ── 双向转发 + 心跳 ──

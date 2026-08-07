@@ -73,10 +73,17 @@ init->(0,0) ssl create->(fd12,1 bind) ->run20/1 acl  ->126/6 vip req
 > 发送出口 `0xe4b59`（channel 解析 + `bed4e`/`f0803` 写 TLS）。
 
 ### 3.3 REQVIP/VIP 请求（第 2 帧）
-根据算法分支：
+
+> ⚠ **2026-08-07 更正**：早先版本此处误记为「当前网关 cmd=0x0004，载荷 0x10」。
+> 经命令分发表（二进制偏移 0x458aa8）+ 实测验证，正确值为：
+> **当前网关 cmd=0x0003，载荷长度=0（仅 16 字节帧头）**。
+
+根据算法分支（命令分发表 0x458aa8 + 反汇编 0xd4731-0xd4754 验证）：
 - **V1 网关（GmAlgorithm=1, cmd=0x0005）**：头 8 字节 + 32 字节 SessionID（来自全局缓冲 0x694f00）。载荷＝ `buff.size = 0x08 + 0x20`
-- **当前网关（GmAlgorithm=0, cmd=0x0004）**：头 16 字节，无 4 字节 session，载荷大小 0x10
-  帧头由 0xbd32f 写：magic + session[0..3] + BE(ctx+0x100值) + cmd + len
+- **当前网关（GmAlgorithm=0, cmd=0x0003）**：标准 16 字节帧头，**载荷长度=0**
+  帧头由 0xbd32f 写：magic + session[0..3] + BE(ctx+0x1f4 = UserID) + cmd(0x0003) + len(0)
+
+实测（2026-08-07 最终验证）：发送 16 字节 REQVIP 帧 → 网关回 ~972 字节 VIP 数据（含 VIP/掩码/DNS/路由）。
 
 ---
 
