@@ -5,6 +5,10 @@ OpenUniVPN 已安装
 用法:
   python3 /opt/openunivpn/auth.py          # 首次运行进入配置向导
   sudo python3 /opt/openunivpn/client.py    # 启动 VPN (TUN 模式)
+
+或使用 systemd 自动管理:
+  sudo systemctl enable --now openunivpn   # 开机自启 + 启动
+  sudo systemctl status openunivpn         # 查看状态
 EOF
 }
 

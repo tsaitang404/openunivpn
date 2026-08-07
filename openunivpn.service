@@ -1,0 +1,25 @@
+[Unit]
+Description=OpenUniVPN — H3C SecPath SSLVPN 开源替代客户端
+Documentation=https://github.com/tsaitang404/openunivpn
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/openunivpn/client.py
+ExecStartPre=/usr/bin/python3 /opt/openunivpn/auth.py
+Restart=on-failure
+RestartSec=10
+# TUN 需要 root
+User=root
+Group=root
+# 清理 TUN 设备
+ExecStopPost=/usr/bin/ip link del cnem0 2>/dev/null
+# 安全加固
+PrivateTmp=true
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target
