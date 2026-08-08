@@ -1,7 +1,7 @@
 # Maintainer: OpenUniVPN
 pkgname=openunivpn
-pkgver=1.1.3
-pkgrel=2
+pkgver=1.1.4
+pkgrel=1
 pkgdesc="H3C SecPath SSLVPN 开源替代客户端"
 arch=('any')
 url="https://github.com/tsaitang404/openunivpn"
