@@ -23,8 +23,10 @@ post_upgrade() {
 OpenUniVPN 已升级
 
 配置说明:
-  升级不会覆盖 /etc/openunivpn/config.conf（配置模板见
-  /etc/openunivpn/config.conf.example）。
-  若尚未配置，请复制模板并填写凭据。
+  /etc/openunivpn/config.conf 不属于包文件（升级不会覆盖）。
+  配置模板见 /etc/openunivpn/config.conf.example。
+  若尚未配置，请复制模板并填写凭据:
+    sudo cp /etc/openunivpn/config.conf.example /etc/openunivpn/config.conf
+    sudo chmod 600 /etc/openunivpn/config.conf
 EOF
 }
