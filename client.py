@@ -151,7 +151,21 @@ def parse_netcfg(payload):
     return vip
 
 
-def probe_gateway(host, ip, ctx1f4):
+def resolve_gateway(addr):
+    """解析网关地址，返回 (sni_host, ip)。addr 可为域名或 IP。"""
+    try:
+        socket.inet_aton(addr)
+        return addr, addr  # 本身就是 IP
+    except OSError:
+        pass
+    try:
+        ip = socket.getaddrinfo(addr, None, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
+        return addr, ip
+    except Exception:
+        return addr, None
+
+
+def probe_gateway(addr, port, ctx1f4):
     """只测 TCP 连通延迟（不建 TLS、不发业务帧）。
 
     重要：不能在此建立 TLS 连接或发送任何 CNEM 帧。
@@ -159,12 +173,15 @@ def probe_gateway(host, ip, ctx1f4):
     会判定异常并对后续主连接返回 KICKOUT (cmd=0x0008)。
     因此探测只做 TCP connect 测延迟，完整握手仅在 main() 中做一次。
     """
+    host, ip = resolve_gateway(addr)
+    if not ip:
+        return None
     t0 = time.time()
     try:
-        raw = socket.create_connection((ip, 4433), timeout=5)
+        raw = socket.create_connection((ip, port), timeout=5)
         raw.close()
         lat = (time.time() - t0) * 1000
-        return {"host": host, "ip": ip, "latency": lat}
+        return {"host": addr, "ip": ip, "port": port, "latency": lat}
     except Exception:
         return None
 
@@ -174,7 +191,7 @@ def select_gateway(ctx1f4, gateways):
     print("[*] 探测网关...")
     results = []
     with ThreadPoolExecutor(max_workers=min(len(gateways), 8)) as pool:
-        futures = {pool.submit(probe_gateway, h, ip, ctx1f4): h for h, ip in gateways}
+        futures = {pool.submit(probe_gateway, addr, port, ctx1f4): addr for addr, port in gateways}
         for f in as_completed(futures):
             r = f.result()
             if r:
@@ -184,7 +201,7 @@ def select_gateway(ctx1f4, gateways):
         sys.exit(1)
     results.sort(key=lambda r: r["latency"])
     for r in results:
-        print(f"  {r['host']}: {r['latency']:.0f}ms")
+        print(f"  {r['host']}:{r['port']} {r['latency']:.0f}ms")
     return results[0]
 
 
@@ -301,7 +318,7 @@ def main():
         # 注：ctx1f4 初始值不重要，NetExtension 认证后会覆盖为认证 UserID
         ctx1f4 = 0
         gw = select_gateway(ctx1f4, gateways)
-        host, ip, latency = gw["host"], gw["ip"], gw["latency"]
+        host, ip, port, latency = gw["host"], gw["ip"], gw["port"], gw["latency"]
 
         # ── 完整握手（对照官方 UniVPNCS 日志时序 2026-08-07 22:37:49-50）──
         #   官方流程（日志验证）：
@@ -318,7 +335,7 @@ def main():
                 auth_ctx.check_hostname = False
                 auth_ctx.verify_mode = ssl.CERT_NONE
                 auth_sock = auth_ctx.wrap_socket(
-                    socket.create_connection((ip, 4433), timeout=10), server_hostname=host)
+                    socket.create_connection((ip, port), timeout=10), server_hostname=host)
                 pwd_enc = password.replace("%", "%25")
                 path = (f"/netextension/netextensionlogin.html?"
                         f"SelectLanguage=0&UserName={username}&Password={pwd_enc}"
@@ -353,7 +370,7 @@ def main():
                     print(f"    响应前 16 字节: {auth_resp[:16].hex()}")
                     sys.exit(1)
             except (socket.timeout, OSError, ssl.SSLError) as e:
-                print(f"[!] 认证失败：无法连接网关 {host}:4433（{e}）")
+                print(f"[!] 认证失败：无法连接网关 {host}:{port}（{e}）")
                 print("    请检查网络连通性和网关地址是否正确。")
                 sys.exit(1)
             except Exception as e:
@@ -364,16 +381,16 @@ def main():
         ssl_ctx = ssl.create_default_context()
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE
-        raw = socket.create_connection((ip, 4433), timeout=15)
+        raw = socket.create_connection((ip, port), timeout=15)
         sock = ssl_ctx.wrap_socket(raw, server_hostname=host)
         sock.settimeout(30)
 
         # 3. UDP socket connect 到网关:4433（模拟 univpn fd=14，数据面激活需要）
         udp_probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            udp_probe.connect((ip, 4433))
+            udp_probe.connect((ip, port))
             udp_probe.settimeout(2)
-            logger.info("UDP socket 已 connect %s:4433", ip)
+            logger.info("UDP socket 已 connect %s:%s", ip, port)
         except Exception as e:
             logger.warning("UDP connect 失败: %s", e)
 
@@ -473,7 +490,7 @@ def main():
             udp_detect = (struct.pack("<I", 0xBEEFFCFE) + bytes.fromhex("c192a4d6")
                           + struct.pack("<I", 0x1000021c) + struct.pack(">I", ctx1f4)
                           + os.urandom(13))
-            udp_probe.sendto(udp_detect, (ip, 4433))
+            udp_probe.sendto(udp_detect, (ip, port))
             logger.info(" UDP 探测帧 %dB 已发送", len(udp_detect))
         except Exception:
             pass

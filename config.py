@@ -40,9 +40,13 @@ def _parse_config(path):
     if gateways_raw:
         for pair in gateways_raw.split(','):
             pair = pair.strip()
-            if ':' in pair:
-                host, ip = pair.split(':', 1)
-                gateways.append((host.strip(), ip.strip()))
+            if not pair:
+                continue
+            # 格式: 地址:端口，地址可为域名或 IP，端口缺省 443
+            parts = pair.split(':')
+            addr = parts[0].strip()
+            port = int(parts[1].strip()) if len(parts) > 1 and parts[1].strip().isdigit() else 443
+            gateways.append((addr, port))
 
     return {
         'username': c.get('auth', 'username', fallback=''),
