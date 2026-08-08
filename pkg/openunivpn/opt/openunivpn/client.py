@@ -587,9 +587,6 @@ def main():
                                 print("  ⚠ 被网关踢出连接 (KICKOUT)")
                                 reconnect[0] = True
                                 break
-                except BlockingIOError:
-                    # EAGAIN：SSL socket 暂时无数据（正常，非错误），继续轮询
-                    continue
                 except socket.timeout:
                     # 长时间无任何回包 → 数据面假死（网关半开连接），触发重连
                     if time.time() - last_rx > STALE_TIMEOUT:
