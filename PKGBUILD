@@ -8,7 +8,7 @@ url="https://github.com/tsaitang404/openunivpn"
 license=('MIT')
 depends=('python>=3.8' 'openresolv')
 makedepends=('git')
-source=("${pkgname}::git+file:///tmp/openunivpn#tag=v${pkgver}")
+source=("git+file:///tmp/openunivpn.git#tag=v${pkgver}")
 sha256sums=('SKIP')
 install="$pkgname.install"
 
