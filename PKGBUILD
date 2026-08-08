@@ -21,10 +21,13 @@ package() {
     # systemd service
     install -Dm644 openunivpn.service -t "$pkgdir/usr/lib/systemd/system/"
 
-    # 系统配置模板（占位，需手动填写凭据）
-    install -Dm600 /dev/stdin "$pkgdir/etc/$pkgname/config.conf" << 'EOF'
+    # 配置模板（example）：不安装实际 config.conf，避免升级覆盖用户配置
+    # 用户首次安装后手动: cp /etc/openunivpn/config.conf.example /etc/openunivpn/config.conf
+    install -Dm644 /dev/stdin "$pkgdir/etc/$pkgname/config.conf.example" << 'EOF'
 # OpenUniVPN 系统级配置模板
-# 拷贝到 /etc/openunivpn/config.conf 后填写凭据，权限应保持 600
+# 拷贝为 /etc/openunivpn/config.conf 后填写凭据，权限应保持 600:
+#   sudo cp /etc/openunivpn/config.conf.example /etc/openunivpn/config.conf
+#   sudo chmod 600 /etc/openunivpn/config.conf
 
 [auth]
 username =
