@@ -35,7 +35,7 @@ CMD_KEEPALIVE = 0x0005
 # v3: 保活改用真实 DNS 查询（UDP 53 走数据面），比 ICMP ping 更接近真实流量
 KEEPALIVE_CHECK_INTERVAL = 6    # 检查间隔（秒）
 KEEPALIVE_IDLE_TIMEOUT = 12     # 距上次发包超过此值则发保活
-REHANDSHAKE_INTERVAL = 180      # 周期性重新握手间隔（秒），刷新数据面会话（官方 2-7 分钟）
+REHANDSHAKE_INTERVAL = 30      # 周期性重新握手间隔（秒），刷新数据面会话
 
 
 def be32(v):
@@ -559,6 +559,7 @@ def main():
 
         # ── TUN 配置 ──
         tun_fd, tun_name = create_tun(tun_name)
+        run_cmd(["ip", "link", "set", tun_name, "mtu", "1360"])
         run_cmd(["ip", "link", "set", tun_name, "up"])
         run_cmd(["ip", "addr", "add", f"{vip['vip_ip']}/24", "dev", tun_name])
         for net, mask in vip["routes"]:
