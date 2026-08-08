@@ -11,6 +11,8 @@ makedepends=('git')
 source=("git+${url}.git#tag=v${pkgver}")
 sha256sums=('SKIP')
 install="$pkgname.install"
+# conffile：升级时若本地修改过 config.conf 会保留为 .pacsave，不静默删除
+backup=('etc/openunivpn/config.conf')
 
 package() {
     cd "$srcdir/$pkgname"
