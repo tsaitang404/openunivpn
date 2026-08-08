@@ -235,49 +235,56 @@ def _systemd_resolved_active():
     return shutil.which("resolvectl") is not None
 
 
-def _resolvectl_dns_set(vpn_dns):
-    """用 resolvectl 设置 systemd-resolved 全局 DNS（VPN DNS 优先 + 原 DNS fallback）"""
+def _resolvectl_dns_set(vpn_dns, iface):
+    """用 resolvectl 把 VPN DNS 绑定到 VPN 链路，保留其他链路 DNS 不变。
+
+    systemd-resolved 按链路管理 DNS：VPN DNS 只服务 VPN 链路（内网查询走它，
+    公共域名仍走原链路 DNS），天然隔离。
+    """
     global _orig_global_dns
     try:
-        # 读取当前全局 DNS（备份）
-        p = subprocess.run(["resolvectl", "dns", "global"],
+        # 读取当前链路 DNS（备份，退出时恢复）
+        p = subprocess.run(["resolvectl", "dns", iface],
                            capture_output=True, text=True)
-        if p.returncode == 0 and p.stdout.strip():
+        if p.returncode == 0 and p.stdout.strip() and ':' not in p.stdout:
             _orig_global_dns = p.stdout.strip().split()
-        # 设置 VPN DNS + 原 DNS
-        dns_args = list(vpn_dns) + ([d for d in (_orig_global_dns or []) if d not in vpn_dns])
-        if dns_args:
-            subprocess.run(["resolvectl", "dns", "global"] + dns_args,
-                           check=True, capture_output=True)
-            logger.info("systemd-resolved 全局 DNS 已设置: %s", dns_args)
+        # 设置 VPN DNS 到该链路
+        subprocess.run(["resolvectl", "dns", iface] + list(vpn_dns),
+                       check=True, capture_output=True)
+        # 标记该链路为默认路由（内网域名查询走此链路）
+        subprocess.run(["resolvectl", "default-route", iface, "true"],
+                       check=False, capture_output=True)
+        logger.info("systemd-resolved 链路 %s DNS 已设置: %s", iface, vpn_dns)
         return True
     except Exception as e:
         logger.warning("resolvectl 设置 DNS 失败: %s", e)
         return False
 
 
-def _resolvectl_dns_restore():
-    """恢复 systemd-resolved 原始全局 DNS"""
+def _resolvectl_dns_restore(iface):
+    """恢复 VPN 链路原始 DNS（若有备份）"""
     global _orig_global_dns
     if not _orig_global_dns:
         return
     try:
-        if _orig_global_dns:
-            subprocess.run(["resolvectl", "dns", "global"] + _orig_global_dns,
-                           check=True, capture_output=True)
-            logger.info("systemd-resolved 全局 DNS 已恢复: %s", _orig_global_dns)
+        subprocess.run(["resolvectl", "dns", iface] + _orig_global_dns,
+                       check=True, capture_output=True)
+        logger.info("systemd-resolved 链路 %s DNS 已恢复: %s", iface, _orig_global_dns)
     except Exception as e:
         logger.warning("恢复 systemd-resolved DNS 失败: %s", e)
     finally:
         _orig_global_dns = None
 
 
-def setup_dns(vpn_dns_list):
-    """把 VPN DNS 加入系统解析（自动适配 systemd-resolved / resolvconf）。"""
+def setup_dns(vpn_dns_list, iface='vpn0'):
+    """把 VPN DNS 加入系统解析（自动适配 systemd-resolved / resolvconf）。
+
+    iface: VPN 接口名（systemd-resolved 按链路绑定 DNS；resolvconf 用接口名排序）
+    """
     if not vpn_dns_list:
         return
     if _systemd_resolved_active():
-        _resolvectl_dns_set(vpn_dns_list)
+        _resolvectl_dns_set(vpn_dns_list, iface)
         return
     if not _resolvconf_available():
         logger.warning("openresolv(resolvconf) 未安装且无 systemd-resolved，跳过 VPN DNS 注入")
@@ -285,7 +292,7 @@ def setup_dns(vpn_dns_list):
     try:
         content = "\n".join(f"nameserver {d}" for d in vpn_dns_list) + "\n"
         p = subprocess.run(
-            ["resolvconf", "-a", RESOLVCONF_IFACE],
+            ["resolvconf", "-a", iface],
             input=content, capture_output=True, text=True,
         )
         if p.returncode == 0:
@@ -296,16 +303,16 @@ def setup_dns(vpn_dns_list):
         logger.warning("更新系统 DNS 失败: %s", e)
 
 
-def restore_dns():
+def restore_dns(iface='vpn0'):
     """VPN 退出时移除 VPN DNS（适配 systemd-resolved / resolvconf）。"""
     if _systemd_resolved_active():
-        _resolvectl_dns_restore()
+        _resolvectl_dns_restore(iface)
         return
     if not _resolvconf_available():
         return
     try:
         p = subprocess.run(
-            ["resolvconf", "-d", RESOLVCONF_IFACE],
+            ["resolvconf", "-d", iface],
             capture_output=True, text=True,
         )
         if p.returncode == 0:
@@ -558,7 +565,7 @@ def main():
         for subnet in ["10.11.0.0/16", "10.12.0.0/16", "10.13.0.0/16"]:
             run_cmd(["ip", "route", "add", subnet, "dev", tun_name])
         if vip["dns"]:
-            setup_dns(vip["dns"])
+            setup_dns(vip["dns"], tun_name)
 
         print(f"\n[*] {host} ({latency:.0f}ms) VIP={vip['vip_ip']} DNS={vip['dns']}")
         print(f"    TUN: {tun_name}  Ctrl+C 停止")
@@ -688,7 +695,7 @@ def main():
         sock.close()
         os.close(tun_fd)
         run_cmd(["ip", "link", "del", tun_name])
-        restore_dns()
+        restore_dns(tun_name)
         print("已清理")
 
         if not reconnect[0] or stop_event.is_set():
