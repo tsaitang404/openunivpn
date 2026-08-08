@@ -222,23 +222,65 @@ def run_cmd(args):
     subprocess.run(args, check=False, capture_output=True)
 
 
-# ── 系统 DNS 管理（通过 openresolv/resolvconf 协调，与 NetworkManager 共存）──
-# 依赖 openresolv 包（PKGBUILD depends）。用接口名 vpn0（在 resolvconf 默认
-# dynamic_order 中，DNS 自动排最前）。NetworkManager 需配置 rc-manager=resolvconf
-# （两者都走 resolvconf，互不覆盖）。
+# ── 系统 DNS 管理 ──
+# 两种机制，按系统实际情况选择：
+#   1. systemd-resolved 活跃 → 用 resolvectl 动态设置/恢复 DNS（Arch 默认）
+#   2. 否则 → 用 openresolv/resolvconf 协调（与 NetworkManager 共存）
 RESOLVCONF_IFACE = 'vpn0'
+_orig_global_dns = None  # 记录 systemd-resolved 原始全局 DNS，退出时恢复
 
-def _resolvconf_available():
-    """resolvconf 是否可用（依赖 openresolv）。缺失时跳过 DNS 注入，避免破坏网络。"""
-    return shutil.which("resolvconf") is not None
+
+def _systemd_resolved_active():
+    """systemd-resolved 是否活跃（resolvectl 可用）"""
+    return shutil.which("resolvectl") is not None
+
+
+def _resolvectl_dns_set(vpn_dns):
+    """用 resolvectl 设置 systemd-resolved 全局 DNS（VPN DNS 优先 + 原 DNS fallback）"""
+    global _orig_global_dns
+    try:
+        # 读取当前全局 DNS（备份）
+        p = subprocess.run(["resolvectl", "dns", "global"],
+                           capture_output=True, text=True)
+        if p.returncode == 0 and p.stdout.strip():
+            _orig_global_dns = p.stdout.strip().split()
+        # 设置 VPN DNS + 原 DNS
+        dns_args = list(vpn_dns) + ([d for d in (_orig_global_dns or []) if d not in vpn_dns])
+        if dns_args:
+            subprocess.run(["resolvectl", "dns", "global"] + dns_args,
+                           check=True, capture_output=True)
+            logger.info("systemd-resolved 全局 DNS 已设置: %s", dns_args)
+        return True
+    except Exception as e:
+        logger.warning("resolvectl 设置 DNS 失败: %s", e)
+        return False
+
+
+def _resolvectl_dns_restore():
+    """恢复 systemd-resolved 原始全局 DNS"""
+    global _orig_global_dns
+    if not _orig_global_dns:
+        return
+    try:
+        if _orig_global_dns:
+            subprocess.run(["resolvectl", "dns", "global"] + _orig_global_dns,
+                           check=True, capture_output=True)
+            logger.info("systemd-resolved 全局 DNS 已恢复: %s", _orig_global_dns)
+    except Exception as e:
+        logger.warning("恢复 systemd-resolved DNS 失败: %s", e)
+    finally:
+        _orig_global_dns = None
 
 
 def setup_dns(vpn_dns_list):
-    """把 VPN DNS 通过 resolvconf 加入系统（自动排最前，保留原 DNS fallback）。"""
+    """把 VPN DNS 加入系统解析（自动适配 systemd-resolved / resolvconf）。"""
     if not vpn_dns_list:
         return
+    if _systemd_resolved_active():
+        _resolvectl_dns_set(vpn_dns_list)
+        return
     if not _resolvconf_available():
-        logger.warning("openresolv(resolvconf) 未安装，跳过 VPN DNS 注入（不影响公网）")
+        logger.warning("openresolv(resolvconf) 未安装且无 systemd-resolved，跳过 VPN DNS 注入")
         return
     try:
         content = "\n".join(f"nameserver {d}" for d in vpn_dns_list) + "\n"
@@ -255,7 +297,10 @@ def setup_dns(vpn_dns_list):
 
 
 def restore_dns():
-    """VPN 退出时从 resolvconf 移除 VPN DNS。"""
+    """VPN 退出时移除 VPN DNS（适配 systemd-resolved / resolvconf）。"""
+    if _systemd_resolved_active():
+        _resolvectl_dns_restore()
+        return
     if not _resolvconf_available():
         return
     try:
@@ -550,8 +595,11 @@ def main():
                             sock.sendall(keepalive_frame)
                         last_keepalive = time.time()
                         logger.info("保活: DATA_CONNECT 0x001A 已发送")
-                    except Exception:
-                        break
+                    except Exception as e:
+                        # 保活失败不退出：记日志后继续重试（socket 半开时 send 可能失败，
+                        # 但 tls_to_tun 假死检测会最终触发重连）
+                        logger.warning("保活发送失败: %s（继续重试）", e)
+                        time.sleep(2)
 
         def tun_to_tls():
             nonlocal last_keepalive
@@ -625,7 +673,9 @@ def main():
         t3.start()
 
         try:
-            while t1.is_alive() and t2.is_alive() and not stop_event.is_set():
+            # 监控全部线程（含保活）：任一线程死亡即退出本会话，
+            # 由 systemd Restart=on-failure 触发整体重连（保活失效 = 隧道假死）
+            while all(t.is_alive() for t in (t1, t2, t3)) and not stop_event.is_set():
                 time.sleep(0.5)
         except KeyboardInterrupt:
             stop_event.set()
