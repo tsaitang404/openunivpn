@@ -35,6 +35,7 @@ CMD_KEEPALIVE = 0x0005
 # v3: 保活改用真实 DNS 查询（UDP 53 走数据面），比 ICMP ping 更接近真实流量
 KEEPALIVE_CHECK_INTERVAL = 6    # 检查间隔（秒）
 KEEPALIVE_IDLE_TIMEOUT = 12     # 距上次发包超过此值则发保活
+REHANDSHAKE_INTERVAL = 180      # 周期性重新握手间隔（秒），刷新数据面会话（官方 2-7 分钟）
 
 
 def be32(v):
@@ -111,6 +112,7 @@ NETCFG_RT_STRIDE = 12
 
 def _parse_ip(b):
     return ".".join(str(x) for x in b)
+
 
 def parse_netcfg(payload):
     """从 REQVIP 响应载荷中提取 VIP/掩码/DNS/路由（精确偏移解析）。"""
@@ -579,34 +581,50 @@ def main():
         reconnect = [False]
 
         def send_keepalive():
-            """每 KEEPALIVE_CHECK_INTERVAL 秒检查一次，距上次发包超过
-            KEEPALIVE_IDLE_TIMEOUT 秒则发送保活流量，防止网关踢连接。
+            """固定周期发送 0x001A 保活 + 周期性重新握手，维持数据面会话。
 
-            ⚠ 2026-08-08 实测结论：
-            - 空闲 ~34s 被网关踢（网关空闲超时）
-            - 0x0005 空载荷心跳、0x0010 UDP探测帧均不被网关视为有效流量
-            - ICMP ping / UDP DNS 保活效果有限
-            - 持续真实流量（HTTP/DNS 查询）连接稳定
-            - cmd=0x001A (DATA_CONNECT) 网关有回包（握手时 payload=11510000）
-            因此保活用 0x001A 帧：网关回包 → last_rx 更新 → 假死检测不触发。"""
-            nonlocal last_keepalive
+            ⚠ 实测结论（2026-08-08/09，两台机器交叉验证）：
+            - 0x0005 空载荷心跳 ❌ 网关不回包（~34s 被踢）
+            - 0x0010 UDP 探测帧 ❌ 网关不回包
+            - ICMP ping / UDP DNS 查询 ❌ 有限（~77s）
+            - 0x001A DATA_CONNECT ✅ 网关必回包（payload=11510000）→ 维持 TCP 连接
+            - 但数据面（0x0002 转发）有独立会话超时（~2-3 分钟），0x001A 无法维持
+            - 官方客户端每 2-7 分钟周期性重新握手（REQVIP→UA→DC）刷新数据面会话
+            因此：每 KEEPALIVE 周期发 0x001A 保活；每 REHANDSHAKE_INTERVAL
+            执行一次完整重新握手，刷新数据面。
+            """
+            last_rehandshake = time.time()
             while running:
                 time.sleep(KEEPALIVE_CHECK_INTERVAL)
-                if time.time() - last_keepalive >= KEEPALIVE_IDLE_TIMEOUT:
+                try:
+                    # 0x001A DATA_CONNECT：网关确认的有效保活帧（有回包）
+                    keepalive_frame = cnem_frame(CMD_DATA_CONNECT,
+                                                 payload=struct.pack(">I", 4),
+                                                 ctx1f4=ctx1f4)
+                    with sock_lock:
+                        sock.sendall(keepalive_frame)
+                    logger.info("保活: DATA_CONNECT 0x001A 已发送")
+                except Exception as e:
+                    logger.warning("保活发送失败: %s（继续重试）", e)
+                    time.sleep(2)
+                    continue
+
+                # 周期性重新握手（刷新数据面会话，防止 2-3 分钟会话超时失效）
+                if time.time() - last_rehandshake >= REHANDSHAKE_INTERVAL:
+                    last_rehandshake = time.time()
                     try:
-                        # 保活帧：DATA_CONNECT(0x001A)，握手阶段网关回包
-                        keepalive_frame = cnem_frame(CMD_DATA_CONNECT,
-                                                     payload=struct.pack(">I", 4),
-                                                     ctx1f4=ctx1f4)
+                        logger.info("执行周期性重新握手（刷新数据面会话）...")
                         with sock_lock:
-                            sock.sendall(keepalive_frame)
-                        last_keepalive = time.time()
-                        logger.info("保活: DATA_CONNECT 0x001A 已发送")
+                            sock.sendall(cnem_frame(CMD_REQVIP, ctx1f4=ctx1f4))
+                            for cmd_val, payload in (
+                                (CMD_UDP_AVAILABLE, struct.pack(">I", 4)),
+                                (CMD_DATA_CONNECT, struct.pack(">I", 4)),
+                            ):
+                                sock.sendall(cnem_frame(cmd_val, payload=payload, ctx1f4=ctx1f4))
+                            sock.sendall(cnem_frame(CMD_UDP_DETECT, ctx1f4=ctx1f4))
+                        logger.info("重新握手完成")
                     except Exception as e:
-                        # 保活失败不退出：记日志后继续重试（socket 半开时 send 可能失败，
-                        # 但 tls_to_tun 假死检测会最终触发重连）
-                        logger.warning("保活发送失败: %s（继续重试）", e)
-                        time.sleep(2)
+                        logger.warning("重新握手失败: %s", e)
 
         def tun_to_tls():
             nonlocal last_keepalive
