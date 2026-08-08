@@ -8,7 +8,7 @@ UniVPN 开源客户端 — 自动选最优网关 + TUN 模式
 """
 import socket, ssl, struct, json, sys, os, time, threading, select, fcntl, subprocess, ipaddress, logging, re, signal, shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from config import load_config, setup_wizard
+from config import load_config, setup_wizard, _find_config
 
 logger = logging.getLogger('openunivpn')
 
@@ -271,11 +271,20 @@ def main():
     signal.signal(signal.SIGINT, _handle_signal)
 
     config = load_config()
+
+    # ── 配置完整性校验：缺项时给出明确诊断，而非笼统报错 ──
+    missing = []
     if not config["gateways"]:
-        print("[!] 未配置, 进入设置向导...\n")
-        if not setup_wizard():
-            sys.exit(1)
-        config = load_config()
+        missing.append("网关列表(gateway.list)")
+    if not config["username"]:
+        missing.append("用户名(auth.username)")
+    if not config["password"]:
+        missing.append("密码(auth.password)")
+    if missing:
+        print("[!] 配置不完整，缺少: " + "、".join(missing))
+        print("    配置文件路径: " + (_find_config() or "(未找到配置文件)"))
+        print("    请编辑该文件后重试。")
+        sys.exit(2)
 
     # 注：ctx1f4 初始值不重要，NetExtension 认证后会覆盖为认证 UserID
     ctx1f4 = 0
@@ -285,43 +294,18 @@ def main():
     gw = select_gateway(ctx1f4, gateways)
     host, ip, latency = gw["host"], gw["ip"], gw["latency"]
 
-    # ── TLS 连接 + 完整握手（ACL → REQVIP）──
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
-    raw = socket.create_connection((ip, 4433), timeout=15)
-    sock = ssl_ctx.wrap_socket(raw, server_hostname=host)
-    sock.settimeout(30)
-
-    # ── 完整握手（双连接，MITM 实测 2026-08-07）──
-    #   连接A（主连接）: 握手帧(0x001D) → ACL → REQVIP → UA → DC → UD → DATA
-    #   连接B（认证连接）: HTTP /netextension 认证 → 166B（UserID + 隧道密钥）
-    #   注意：HTTP 认证必须在独立连接（同连接会 Broken pipe）
-    #   数据面还需 UDP socket connect 到网关:4433（模拟 univpn fd=14）
-
     username = config["username"]
     password = config["password"]
 
-    # 0. 连接A 握手帧（cmd=0x001D，340B：Linux64 + 网关域名，ctx=0）
-    handshake_payload = bytearray(324)
-    handshake_payload[0:7] = b"Linux64"
-    domain_b = host.encode()
-    handshake_payload[64:64 + len(domain_b)] = domain_b
-    handshake_payload[320:323] = b"\x01\x00\x00"
-    sock.sendall(cnem_frame(CMD_HANDSHAKE, payload=bytes(handshake_payload), ctx1f4=0))
-    try:
-        sock.settimeout(3)
-        hs_resp = sock.recv(65536)
-        if hs_resp:
-            hs_cmd, _, _ = parse_cnem(hs_resp)
-            logger.info("握手帧响应 cmd=0x%04x (%dB)", hs_cmd or 0, len(hs_resp))
-    except socket.timeout:
-        logger.warning("握手帧无响应")
-    except Exception:
-        pass
-    sock.settimeout(30)
+    # ── 完整握手（对照官方 UniVPNCS 日志时序 2026-08-07 22:37:49-50）──
+    #   官方流程（日志验证）：
+    #     1. Master Auth：独立短连接完成认证（拿 UserID），随即关闭
+    #     2. SSL Start Nem：新建 CNEM 主连接 fd=12，第一帧即 ACL
+    #     3. ACL → REQVIP → UDP_AVAILABLE → DATA_CONNECT → UDP_DETECT → DATA
+    #   ⚠ 官方主连接第一帧就是 ACL，无额外"握手帧(0x001D)"；认证与主连接是
+    #     两个不同连接。旧实现先建主连接发 0x001D 再认证，导致网关 KICKOUT。
 
-    # 0.5 连接B：HTTP NetExtension 认证（独立连接）
+    # 1. 认证短连接（独立连接，认证完即关闭）
     if username and password:
         try:
             auth_ctx = ssl.create_default_context()
@@ -346,6 +330,11 @@ def main():
             auth_sock.close()
             if auth_resp[:4] == b"\xf0\xf0\xf0\xf0":
                 new_uid = struct.unpack(">I", auth_resp[4:8])[0]
+                # 网关对认证失败返回 UserID=0xfffffffb(-5) 等错误码，须与合法 UserID 区分
+                if new_uid == 0 or new_uid >= 0xFFFFF000:
+                    print(f"[!] 认证失败：网关 {host} 拒绝登录（错误码 0x{new_uid:08x}）")
+                    print("    可能原因：用户名或密码错误、账号被禁用/锁定。")
+                    sys.exit(1)
                 ctx1f4 = new_uid  # 用认证 UserID 作为 CNEM ctx
                 m = re.search(rb"[A-Za-z0-9+/=]{44}", auth_resp)
                 if m:
@@ -353,13 +342,27 @@ def main():
                 else:
                     logger.info("NetExtension 认证成功 UserID=0x%08x", new_uid)
             else:
-                logger.warning("NetExtension 认证失败 (%dB)", len(auth_resp))
+                print(f"[!] 认证失败：网关 {host} 拒绝登录（{len(auth_resp)}B）")
+                print("    可能原因：用户名或密码错误、账号被禁用/锁定、或不允许当前来源拨入。")
+                print(f"    响应前 16 字节: {auth_resp[:16].hex()}")
                 sys.exit(1)
+        except (socket.timeout, OSError, ssl.SSLError) as e:
+            print(f"[!] 认证失败：无法连接网关 {host}:4433（{e}）")
+            print("    请检查网络连通性和网关地址是否正确。")
+            sys.exit(1)
         except Exception as e:
-            logger.error("NetExtension 认证异常: %s", e)
+            print(f"[!] 认证异常：{e}")
             sys.exit(1)
 
-    # 0.6 UDP socket connect 到网关:4433（模拟 univpn fd=14，数据面激活需要）
+    # 2. 新建 CNEM 主连接（fd=12），第一帧即 ACL（官方时序，无握手帧）
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    raw = socket.create_connection((ip, 4433), timeout=15)
+    sock = ssl_ctx.wrap_socket(raw, server_hostname=host)
+    sock.settimeout(30)
+
+    # 3. UDP socket connect 到网关:4433（模拟 univpn fd=14，数据面激活需要）
     udp_probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         udp_probe.connect((ip, 4433))
@@ -368,7 +371,7 @@ def main():
     except Exception as e:
         logger.warning("UDP connect 失败: %s", e)
 
-    # 1. ACL（连接A，20B：16B 头 + 4B ctx+0x1f8）
+    # 4. ACL（连接A第一帧，20B：16B 头 + 4B ctx+0x1f8，ctx=认证UserID）
     sock.sendall(cnem_frame(CMD_ACL, extra_be32=0, ctx1f4=ctx1f4))
     acl_resp = b""
     try:
@@ -386,8 +389,8 @@ def main():
     sock.sendall(cnem_frame(CMD_REQVIP, ctx1f4=ctx1f4))
     buf = b""
     try:
-        sock.settimeout(5)
-        for _ in range(5):
+        sock.settimeout(15)
+        for _ in range(10):
             d = sock.recv(65536)
             if not d:
                 break
@@ -443,9 +446,13 @@ def main():
                       + struct.pack("<I", 0x1000021c) + struct.pack(">I", ctx1f4)
                       + os.urandom(13))
         udp_probe.sendto(udp_detect, (ip, 4433))
-        logger.info("UDP 探测帧 %dB 已发送", len(udp_detect))
+        logger.info(" UDP 探测帧 %dB 已发送", len(udp_detect))
     except Exception:
         pass
+
+    # 等待 UDP 探测超时（官方客户端在此等 2 秒后切换到 SSL 模式）
+    logger.info("等待 UDP 探测超时（2秒）...")
+    time.sleep(2)
 
     # ── TUN 配置 ──
     tun_fd, tun_name = create_tun(tun_name)
