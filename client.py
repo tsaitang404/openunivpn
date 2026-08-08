@@ -29,8 +29,12 @@ CMD_DATA = 0x0002        # 数据帧
 CMD_KEEPALIVE = 0x0005
 
 # 心跳参数
-KEEPALIVE_CHECK_INTERVAL = 10   # 检查间隔（秒）
-KEEPALIVE_IDLE_TIMEOUT = 30     # 距上次发包超过此值则发心跳
+# ⚠ 2026-08-08 实测：网关对空闲连接固定 ~34 秒踢（3 次采样均 34s）。
+# 网关超时窗口约 30 秒，原配置 30 秒才发心跳正好卡在边界被踢。
+# 缩短为 8 秒间隔 / 15 秒空闲即发心跳，确保网关窗口内必有包。
+# v3: 保活改用真实 DNS 查询（UDP 53 走数据面），比 ICMP ping 更接近真实流量
+KEEPALIVE_CHECK_INTERVAL = 6    # 检查间隔（秒）
+KEEPALIVE_IDLE_TIMEOUT = 12     # 距上次发包超过此值则发保活
 
 
 def be32(v):
@@ -524,17 +528,28 @@ def main():
 
         def send_keepalive():
             """每 KEEPALIVE_CHECK_INTERVAL 秒检查一次，距上次发包超过
-            KEEPALIVE_IDLE_TIMEOUT 秒则发送心跳帧，防止网关踢连接。"""
+            KEEPALIVE_IDLE_TIMEOUT 秒则发送保活流量，防止网关踢连接。
+
+            ⚠ 2026-08-08 实测结论：
+            - 空闲 ~34s 被网关踢（网关空闲超时）
+            - 0x0005 空载荷心跳、0x0010 UDP探测帧均不被网关视为有效流量
+            - ICMP ping / UDP DNS 保活效果有限
+            - 持续真实流量（HTTP/DNS 查询）连接稳定
+            - cmd=0x001A (DATA_CONNECT) 网关有回包（握手时 payload=11510000）
+            因此保活用 0x001A 帧：网关回包 → last_rx 更新 → 假死检测不触发。"""
             nonlocal last_keepalive
             while running:
                 time.sleep(KEEPALIVE_CHECK_INTERVAL)
                 if time.time() - last_keepalive >= KEEPALIVE_IDLE_TIMEOUT:
                     try:
-                        # 心跳帧 ctx 必须是认证 UserID（不能用 0）
-                        keepalive_frame = cnem_frame(CMD_KEEPALIVE, ctx1f4=ctx1f4)
+                        # 保活帧：DATA_CONNECT(0x001A)，握手阶段网关回包
+                        keepalive_frame = cnem_frame(CMD_DATA_CONNECT,
+                                                     payload=struct.pack(">I", 4),
+                                                     ctx1f4=ctx1f4)
                         with sock_lock:
                             sock.sendall(keepalive_frame)
                         last_keepalive = time.time()
+                        logger.info("保活: DATA_CONNECT 0x001A 已发送")
                     except Exception:
                         break
 
@@ -626,8 +641,8 @@ def main():
         restore_dns()
         print("已清理")
 
-        if not reconnect[0]:
-            break  # 正常退出（收到停止信号）
+        if not reconnect[0] or stop_event.is_set():
+            break  # 正常退出（收到停止信号/手动停止）
 
         print(f"[*] 数据面断开，{RECONNECT_DELAY} 秒后重连...")
         time.sleep(RECONNECT_DELAY)
