@@ -36,7 +36,7 @@ password = <密码>
 
 [gateway]
 # 格式: host:ip,host:ip  —— host 用于 TLS SNI，ip 用于实际连接
-list = szvpn.example.com:1.2.3.4,bjvpn.example.com:5.6.7.8
+list = vpn.example.com:1.2.3.4,bjvpn.example.com:5.6.7.8
 
 [tun]
 name = cnem0
