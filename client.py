@@ -35,7 +35,6 @@ CMD_KEEPALIVE = 0x0005
 # v3: 保活改用真实 DNS 查询（UDP 53 走数据面），比 ICMP ping 更接近真实流量
 KEEPALIVE_CHECK_INTERVAL = 6    # 检查间隔（秒）
 KEEPALIVE_IDLE_TIMEOUT = 12     # 距上次发包超过此值则发保活
-REHANDSHAKE_INTERVAL = 30      # 周期性重新握手间隔（秒），刷新数据面会话
 
 
 def be32(v):
@@ -112,7 +111,6 @@ NETCFG_RT_STRIDE = 12
 
 def _parse_ip(b):
     return ".".join(str(x) for x in b)
-
 
 def parse_netcfg(payload):
     """从 REQVIP 响应载荷中提取 VIP/掩码/DNS/路由（精确偏移解析）。"""
@@ -224,77 +222,28 @@ def run_cmd(args):
     subprocess.run(args, check=False, capture_output=True)
 
 
-# ── 系统 DNS 管理 ──
-# 两种机制，按系统实际情况选择：
-#   1. systemd-resolved 活跃 → 用 resolvectl 动态设置/恢复 DNS（Arch 默认）
-#   2. 否则 → 用 openresolv/resolvconf 协调（与 NetworkManager 共存）
+# ── 系统 DNS 管理（通过 openresolv/resolvconf 协调，与 NetworkManager 共存）──
+# 依赖 openresolv 包（PKGBUILD depends）。用接口名 vpn0（在 resolvconf 默认
+# dynamic_order 中，DNS 自动排最前）。NetworkManager 需配置 rc-manager=resolvconf
+# （两者都走 resolvconf，互不覆盖）。
 RESOLVCONF_IFACE = 'vpn0'
-_orig_global_dns = None  # 记录 systemd-resolved 原始全局 DNS，退出时恢复
+
+def _resolvconf_available():
+    """resolvconf 是否可用（依赖 openresolv）。缺失时跳过 DNS 注入，避免破坏网络。"""
+    return shutil.which("resolvconf") is not None
 
 
-def _systemd_resolved_active():
-    """systemd-resolved 是否活跃（resolvectl 可用）"""
-    return shutil.which("resolvectl") is not None
-
-
-def _resolvectl_dns_set(vpn_dns, iface):
-    """用 resolvectl 把 VPN DNS 绑定到 VPN 链路，保留其他链路 DNS 不变。
-
-    systemd-resolved 按链路管理 DNS：VPN DNS 只服务 VPN 链路（内网查询走它，
-    公共域名仍走原链路 DNS），天然隔离。
-    """
-    global _orig_global_dns
-    try:
-        # 读取当前链路 DNS（备份，退出时恢复）
-        p = subprocess.run(["resolvectl", "dns", iface],
-                           capture_output=True, text=True)
-        if p.returncode == 0 and p.stdout.strip() and ':' not in p.stdout:
-            _orig_global_dns = p.stdout.strip().split()
-        # 设置 VPN DNS 到该链路
-        subprocess.run(["resolvectl", "dns", iface] + list(vpn_dns),
-                       check=True, capture_output=True)
-        # 标记该链路为默认路由（内网域名查询走此链路）
-        subprocess.run(["resolvectl", "default-route", iface, "true"],
-                       check=False, capture_output=True)
-        logger.info("systemd-resolved 链路 %s DNS 已设置: %s", iface, vpn_dns)
-        return True
-    except Exception as e:
-        logger.warning("resolvectl 设置 DNS 失败: %s", e)
-        return False
-
-
-def _resolvectl_dns_restore(iface):
-    """恢复 VPN 链路原始 DNS（若有备份）"""
-    global _orig_global_dns
-    if not _orig_global_dns:
-        return
-    try:
-        subprocess.run(["resolvectl", "dns", iface] + _orig_global_dns,
-                       check=True, capture_output=True)
-        logger.info("systemd-resolved 链路 %s DNS 已恢复: %s", iface, _orig_global_dns)
-    except Exception as e:
-        logger.warning("恢复 systemd-resolved DNS 失败: %s", e)
-    finally:
-        _orig_global_dns = None
-
-
-def setup_dns(vpn_dns_list, iface='vpn0'):
-    """把 VPN DNS 加入系统解析（自动适配 systemd-resolved / resolvconf）。
-
-    iface: VPN 接口名（systemd-resolved 按链路绑定 DNS；resolvconf 用接口名排序）
-    """
+def setup_dns(vpn_dns_list):
+    """把 VPN DNS 通过 resolvconf 加入系统（自动排最前，保留原 DNS fallback）。"""
     if not vpn_dns_list:
         return
-    if _systemd_resolved_active():
-        _resolvectl_dns_set(vpn_dns_list, iface)
-        return
     if not _resolvconf_available():
-        logger.warning("openresolv(resolvconf) 未安装且无 systemd-resolved，跳过 VPN DNS 注入")
+        logger.warning("openresolv(resolvconf) 未安装，跳过 VPN DNS 注入（不影响公网）")
         return
     try:
         content = "\n".join(f"nameserver {d}" for d in vpn_dns_list) + "\n"
         p = subprocess.run(
-            ["resolvconf", "-a", iface],
+            ["resolvconf", "-a", RESOLVCONF_IFACE],
             input=content, capture_output=True, text=True,
         )
         if p.returncode == 0:
@@ -305,16 +254,13 @@ def setup_dns(vpn_dns_list, iface='vpn0'):
         logger.warning("更新系统 DNS 失败: %s", e)
 
 
-def restore_dns(iface='vpn0'):
-    """VPN 退出时移除 VPN DNS（适配 systemd-resolved / resolvconf）。"""
-    if _systemd_resolved_active():
-        _resolvectl_dns_restore(iface)
-        return
+def restore_dns():
+    """VPN 退出时从 resolvconf 移除 VPN DNS。"""
     if not _resolvconf_available():
         return
     try:
         p = subprocess.run(
-            ["resolvconf", "-d", iface],
+            ["resolvconf", "-d", RESOLVCONF_IFACE],
             capture_output=True, text=True,
         )
         if p.returncode == 0:
@@ -559,7 +505,6 @@ def main():
 
         # ── TUN 配置 ──
         tun_fd, tun_name = create_tun(tun_name)
-        run_cmd(["ip", "link", "set", tun_name, "mtu", "1360"])
         run_cmd(["ip", "link", "set", tun_name, "up"])
         run_cmd(["ip", "addr", "add", f"{vip['vip_ip']}/24", "dev", tun_name])
         for net, mask in vip["routes"]:
@@ -568,7 +513,7 @@ def main():
         for subnet in ["10.11.0.0/16", "10.12.0.0/16", "10.13.0.0/16"]:
             run_cmd(["ip", "route", "add", subnet, "dev", tun_name])
         if vip["dns"]:
-            setup_dns(vip["dns"], tun_name)
+            setup_dns(vip["dns"])
 
         print(f"\n[*] {host} ({latency:.0f}ms) VIP={vip['vip_ip']} DNS={vip['dns']}")
         print(f"    TUN: {tun_name}  Ctrl+C 停止")
@@ -582,50 +527,31 @@ def main():
         reconnect = [False]
 
         def send_keepalive():
-            """固定周期发送 0x001A 保活 + 周期性重新握手，维持数据面会话。
+            """每 KEEPALIVE_CHECK_INTERVAL 秒检查一次，距上次发包超过
+            KEEPALIVE_IDLE_TIMEOUT 秒则发送保活流量，防止网关踢连接。
 
-            ⚠ 实测结论（2026-08-08/09，两台机器交叉验证）：
-            - 0x0005 空载荷心跳 ❌ 网关不回包（~34s 被踢）
-            - 0x0010 UDP 探测帧 ❌ 网关不回包
-            - ICMP ping / UDP DNS 查询 ❌ 有限（~77s）
-            - 0x001A DATA_CONNECT ✅ 网关必回包（payload=11510000）→ 维持 TCP 连接
-            - 但数据面（0x0002 转发）有独立会话超时（~2-3 分钟），0x001A 无法维持
-            - 官方客户端每 2-7 分钟周期性重新握手（REQVIP→UA→DC）刷新数据面会话
-            因此：每 KEEPALIVE 周期发 0x001A 保活；每 REHANDSHAKE_INTERVAL
-            执行一次完整重新握手，刷新数据面。
-            """
-            last_rehandshake = time.time()
+            ⚠ 2026-08-08 实测结论：
+            - 空闲 ~34s 被网关踢（网关空闲超时）
+            - 0x0005 空载荷心跳、0x0010 UDP探测帧均不被网关视为有效流量
+            - ICMP ping / UDP DNS 保活效果有限
+            - 持续真实流量（HTTP/DNS 查询）连接稳定
+            - cmd=0x001A (DATA_CONNECT) 网关有回包（握手时 payload=11510000）
+            因此保活用 0x001A 帧：网关回包 → last_rx 更新 → 假死检测不触发。"""
+            nonlocal last_keepalive
             while running:
                 time.sleep(KEEPALIVE_CHECK_INTERVAL)
-                try:
-                    # 0x001A DATA_CONNECT：网关确认的有效保活帧（有回包）
-                    keepalive_frame = cnem_frame(CMD_DATA_CONNECT,
-                                                 payload=struct.pack(">I", 4),
-                                                 ctx1f4=ctx1f4)
-                    with sock_lock:
-                        sock.sendall(keepalive_frame)
-                    logger.info("保活: DATA_CONNECT 0x001A 已发送")
-                except Exception as e:
-                    logger.warning("保活发送失败: %s（继续重试）", e)
-                    time.sleep(2)
-                    continue
-
-                # 周期性重新握手（刷新数据面会话，防止 2-3 分钟会话超时失效）
-                if time.time() - last_rehandshake >= REHANDSHAKE_INTERVAL:
-                    last_rehandshake = time.time()
+                if time.time() - last_keepalive >= KEEPALIVE_IDLE_TIMEOUT:
                     try:
-                        logger.info("执行周期性重新握手（刷新数据面会话）...")
+                        # 保活帧：DATA_CONNECT(0x001A)，握手阶段网关回包
+                        keepalive_frame = cnem_frame(CMD_DATA_CONNECT,
+                                                     payload=struct.pack(">I", 4),
+                                                     ctx1f4=ctx1f4)
                         with sock_lock:
-                            sock.sendall(cnem_frame(CMD_REQVIP, ctx1f4=ctx1f4))
-                            for cmd_val, payload in (
-                                (CMD_UDP_AVAILABLE, struct.pack(">I", 4)),
-                                (CMD_DATA_CONNECT, struct.pack(">I", 4)),
-                            ):
-                                sock.sendall(cnem_frame(cmd_val, payload=payload, ctx1f4=ctx1f4))
-                            sock.sendall(cnem_frame(CMD_UDP_DETECT, ctx1f4=ctx1f4))
-                        logger.info("重新握手完成")
-                    except Exception as e:
-                        logger.warning("重新握手失败: %s", e)
+                            sock.sendall(keepalive_frame)
+                        last_keepalive = time.time()
+                        logger.info("保活: DATA_CONNECT 0x001A 已发送")
+                    except Exception:
+                        break
 
         def tun_to_tls():
             nonlocal last_keepalive
@@ -658,7 +584,6 @@ def main():
                         print("  [!] TLS连接关闭，触发重连")
                         reconnect[0] = True
                         break
-                    last_rx = time.time()
                     buf += data
                     while len(buf) >= 16:
                         cmd, payload, remaining = parse_cnem(buf)
@@ -666,11 +591,17 @@ def main():
                             break
                         buf = remaining
                         if cmd == CMD_DATA and payload:
+                            last_rx = time.time()  # 仅数据帧更新（控制帧回包不算，防假死检测被保活欺骗）
                             os.write(tun_fd, payload)
                         elif cmd in (0x0008, 0x0005, 0x000D, 0x001A, 0x0003):
                             # 控制帧：KICKOUT(0x0008)/KEEPALIVE(0x0005) 等，打印供诊断
                             logger.info("  收到控制帧 cmd=0x%04x plen=%d %s",
                                          cmd, len(payload), payload.hex()[:64])
+                            # 即使收到控制帧回包，数据面(0x0002)可能已假死；检查并重连
+                            if time.time() - last_rx > STALE_TIMEOUT:
+                                print(f"  [!] 数据面假死（{STALE_TIMEOUT}s 无数据帧回包），触发重连")
+                                reconnect[0] = True
+                                break
                             if cmd == 0x0008:
                                 # KICKOUT：被服务器踢出（网关不发错误码，统一提示）
                                 print("  ⚠ 被网关踢出连接 (KICKOUT)")
@@ -699,9 +630,7 @@ def main():
         t3.start()
 
         try:
-            # 监控全部线程（含保活）：任一线程死亡即退出本会话，
-            # 由 systemd Restart=on-failure 触发整体重连（保活失效 = 隧道假死）
-            while all(t.is_alive() for t in (t1, t2, t3)) and not stop_event.is_set():
+            while t1.is_alive() and t2.is_alive() and not stop_event.is_set():
                 time.sleep(0.5)
         except KeyboardInterrupt:
             stop_event.set()
@@ -714,7 +643,7 @@ def main():
         sock.close()
         os.close(tun_fd)
         run_cmd(["ip", "link", "del", tun_name])
-        restore_dns(tun_name)
+        restore_dns()
         print("已清理")
 
         if not reconnect[0] or stop_event.is_set():

@@ -1,6 +1,6 @@
 # Maintainer: OpenUniVPN
 pkgname=openunivpn
-pkgver=1.1.5
+pkgver=1.1.6
 pkgrel=1
 pkgdesc="H3C SecPath SSLVPN 开源替代客户端"
 arch=('any')
@@ -21,20 +21,19 @@ package() {
     # systemd service
     install -Dm644 openunivpn.service -t "$pkgdir/usr/lib/systemd/system/"
 
-    # 配置模板（example）：不安装实际 config.conf，避免升级覆盖用户配置
-    # 用户首次安装后手动: cp /etc/openunivpn/config.conf.example /etc/openunivpn/config.conf
-    install -Dm644 /dev/stdin "$pkgdir/etc/$pkgname/config.conf.example" << 'EOF'
-# OpenUniVPN 系统级配置模板
-# 拷贝为 /etc/openunivpn/config.conf 后填写凭据，权限应保持 600:
-#   sudo cp /etc/openunivpn/config.conf.example /etc/openunivpn/config.conf
-#   sudo chmod 600 /etc/openunivpn/config.conf
+    # 系统配置示例（不直接安装 config.conf——升级时 pacman 会覆盖用户配置！
+    # 规范：包内只装 example，运行时缺配置才由 service 从 example 复制）
+    install -Dm600 /dev/stdin "$pkgdir/etc/$pkgname/config.conf.example" << 'EOF'
+# OpenUniVPN 系统级配置示例
+# 首次运行：sudo cp /etc/openunivpn/config.conf.example /etc/openunivpn/config.conf
+# 然后编辑 /etc/openunivpn/config.conf 填写凭据，权限应保持 600
 
 [auth]
 username =
 password =
 
 [gateway]
-# 格式: host:ip,host:ip
+# 格式: host:ip 或 host:port（缺省 443）
 list =
 
 [tun]

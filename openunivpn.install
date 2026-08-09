@@ -2,31 +2,19 @@ post_install() {
     cat << 'EOF'
 OpenUniVPN 已安装
 
-首次配置（重要）:
-  复制配置模板并填写用户名、密码和网关列表:
-    sudo cp /etc/openunivpn/config.conf.example /etc/openunivpn/config.conf
-    sudo chmod 600 /etc/openunivpn/config.conf
-    sudo nano /etc/openunivpn/config.conf
+用法:
+  编辑 /etc/openunivpn/config.conf 填入用户名、密码和网关列表
+  sudo python3 /opt/openunivpn/client.py    # 启动 VPN (TUN 模式)
 
-启动 VPN:
+或使用 systemd 自动管理:
   sudo systemctl enable --now openunivpn   # 开机自启 + 启动
   sudo systemctl status openunivpn         # 查看状态
 
 DNS 说明:
-  客户端自动适配 systemd-resolved（resolvectl 绑定 VPN 链路）或 openresolv，
-  内网域名自动走 VPN DNS，断开时自动恢复，无需手工配置。
+  客户端通过 openresolv(resolvconf) 管理 VPN DNS。若未安装 openresolv
+  或 NetworkManager 未配置 rc-manager=resolvconf，则仅内网域名解析不可用，
+  不影响公网网络。如需完整支持，请自行安装 openresolv 并按需配置。
 EOF
 }
 
-post_upgrade() {
-    cat << 'EOF'
-OpenUniVPN 已升级
-
-配置说明:
-  /etc/openunivpn/config.conf 不属于包文件（升级不会覆盖）。
-  配置模板见 /etc/openunivpn/config.conf.example。
-  若尚未配置，请复制模板并填写凭据:
-    sudo cp /etc/openunivpn/config.conf.example /etc/openunivpn/config.conf
-    sudo chmod 600 /etc/openunivpn/config.conf
-EOF
-}
+post_upgrade() { post_install; }
