@@ -33,6 +33,7 @@ jobs:
           ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
           echo "$AUR_SSH_KEY" > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur"
           git clone ssh://aur@aur.archlinux.org/openunivpn.git /tmp/aur
           cd /tmp/aur
           git config user.name "tsaitang404"
