@@ -1,4 +1,4 @@
-# Maintainer: OpenUniVPN
+# Maintainer: tsaitang404 <tsaitang.agent@gmail.com>
 pkgname=openunivpn
 pkgver=1.1.6
 pkgrel=1
