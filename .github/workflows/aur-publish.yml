@@ -6,8 +6,32 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install build dependencies
+        run: pacman -Syu --noconfirm git python openresolv
+      - uses: actions/checkout@v4
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+      - name: Build Arch package
+        run: |
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          su builder -c "cd '$GITHUB_WORKSPACE' && makepkg --noconfirm"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openunivpn-arch-package
+          path: '*.pkg.tar.zst'
+          if-no-files-found: error
+
   aur-publish:
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
