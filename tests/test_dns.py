@@ -6,8 +6,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import dns_backend
 import client
+import config as config_module
+import dns_backend
 
 
 class DnsmasqTest(unittest.TestCase):
@@ -76,6 +77,36 @@ class DnsmasqTest(unittest.TestCase):
 
 
 class GatewayTrustTest(unittest.TestCase):
+    @patch('dns_backend.subprocess.run')
+    def test_broadcast_route_does_not_qualify_as_tunnel_route(self, run):
+        run.return_value = subprocess.CompletedProcess([], 0, '[{"type":"broadcast","dev":"tun-test"}]')
+        self.assertFalse(dns_backend.routed_to_tunnel('10.11.8.255', 'tun-test'))
+
+    def test_resolvconf_ignores_unused_static_servers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.conf'
+            path.write_text('[dns]\nbackend=resolvconf\nservers=not-an-ip\n')
+            self.assertEqual(config_module._parse_config(path)['dns_servers'], [])
+
+    def test_unverified_gateway_uses_only_configured_dns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_file = Path(tmp) / 'config.conf'
+            config_file.write_text('[dns]\nbackend=dnsmasq\nservers=10.11.8.2,10.11.8.3\n'
+                                   '[gateway]\ntls_verify=false\n')
+            config = config_module._parse_config(config_file)
+        ctx = client.gateway_tls_context(config)
+        self.assertFalse(ctx.check_hostname)
+        self.assertEqual(ctx.verify_mode, ssl.CERT_NONE)
+        self.assertEqual(client.select_session_dns(config, ['192.0.2.1']),
+                         ['10.11.8.2', '10.11.8.3'])
+
+    def test_unverified_gateway_requires_configured_dns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_file = Path(tmp) / 'config.conf'
+            config_file.write_text('[dns]\nbackend=dnsmasq\n[gateway]\ntls_verify=false\n')
+            with self.assertRaisesRegex(ValueError, 'servers'):
+                config_module._parse_config(config_file)
+
     def test_exclusive_backend_verifies_tls_peer(self):
         ctx = client.gateway_tls_context({'dns_backend': 'dnsmasq'})
         self.assertTrue(ctx.check_hostname)
