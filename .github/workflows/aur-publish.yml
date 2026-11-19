@@ -2,7 +2,6 @@ name: aur-publish
 
 on:
   push:
-    branches: [main]
     tags: ['v*']
   workflow_dispatch:
 
@@ -32,6 +31,7 @@ jobs:
 
   aur-publish:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -62,7 +62,7 @@ jobs:
           cd /tmp/aur
           git config user.name "tsaitang404"
           git config user.email "tsaitang.agent@gmail.com"
-          for f in PKGBUILD .SRCINFO openunivpn.install openunivpn.service README.md LICENSE client.py config.py protocol-format.md .gitignore; do
+          for f in PKGBUILD .SRCINFO openunivpn.install openunivpn.service README.md LICENSE client.py config.py dns_backend.py protocol-format.md .gitignore; do
             [ -f "$GITHUB_WORKSPACE/$f" ] && cp "$GITHUB_WORKSPACE/$f" .
           done
           git add -A
