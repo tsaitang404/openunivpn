@@ -51,30 +51,37 @@ def tunnel_dns_servers(addresses, tun_name):
     return servers
 
 
-def activate(addresses, tun_name):
+def activate(addresses, tun_name, *, before_change=None):
     servers = tunnel_dns_servers(addresses, tun_name)
     if not servers:
         return False
     if not OFFLINE.is_file() or not ACTIVE.is_symlink() or Path(os.readlink(ACTIVE)) != OFFLINE:
         raise OSError('dnsmasq integration not ready: expected the offline servers file and its runtime symlink')
+    if before_change is not None:
+        before_change()
     replace_active(''.join(f'server={ip}\n' for ip in servers))
     try:
         reload_dnsmasq()
     except (OSError, subprocess.SubprocessError):
-        restore()
+        if before_change is None:
+            restore()
         raise
     return True
 
 
-def restore():
+def restore(*, required=False):
     if ACTIVE.is_symlink():
         if Path(os.readlink(ACTIVE)) != OFFLINE or not OFFLINE.is_file():
+            if required:
+                raise OSError('dnsmasq offline servers symlink is invalid')
             return
     elif ACTIVE.is_file():
         if not OFFLINE.is_file():
             raise OSError('dnsmasq offline servers file is missing')
         replace_active()
     else:
+        if required:
+            raise OSError('dnsmasq runtime servers file is missing')
         return
     # Retry reload even after an earlier attempt restored the symlink.
     reload_dnsmasq()

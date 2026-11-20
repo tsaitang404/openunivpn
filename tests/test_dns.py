@@ -158,7 +158,8 @@ class GatewayTrustTest(unittest.TestCase):
         'dns_backend': 'dnsmasq', 'gateways': [('vpn.example', 443)],
         'username': 'test', 'password': 'test',
     })
-    def test_standalone_exception_restores_dns(self, load, geteuid, signal, run, restore):
-        with self.assertRaises(RuntimeError):
+    def test_standalone_exception_survives_dns_restore_failure(self, load, geteuid, signal, run, restore):
+        restore.side_effect = OSError('restore failed')
+        with self.assertLogs('openunivpn', level='ERROR'), self.assertRaisesRegex(RuntimeError, 'session failed'):
             client.main()
         restore.assert_called_once_with('dnsmasq')

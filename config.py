@@ -58,9 +58,15 @@ def _parse_config(path):
             if not pair:
                 continue
             # 格式: 地址:端口，地址可为域名或 IP，端口缺省 443
-            parts = pair.split(':')
-            addr = parts[0].strip()
-            port = int(parts[1].strip()) if len(parts) > 1 and parts[1].strip().isdigit() else 443
+            addr, sep, port_text = pair.partition(':')
+            addr, port_text = addr.strip(), port_text.strip()
+            if not addr or any(c.isspace() for c in addr):
+                raise ValueError('[gateway] list requires a hostname or IPv4 address')
+            if sep and not (port_text.isascii() and port_text.isdecimal()):
+                raise ValueError('[gateway] list requires a numeric port after colon')
+            port = int(port_text) if sep else 443
+            if not 1 <= port <= 65535:
+                raise ValueError('[gateway] list port must be in 1..65535')
             gateways.append((addr, port))
 
     return {
