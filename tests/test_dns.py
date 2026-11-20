@@ -112,6 +112,44 @@ class GatewayTrustTest(unittest.TestCase):
         self.assertTrue(ctx.check_hostname)
         self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
 
+    def test_default_backend_verifies_tls_peer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.conf'
+            path.write_text('')
+            config = config_module._parse_config(path)
+        self.assertEqual(config['dns_backend'], 'resolvconf')
+        for opts in (config, {'dns_backend': 'resolvconf'}, {}):
+            with self.subTest(opts=opts):
+                ctx = client.gateway_tls_context(opts)
+                self.assertTrue(ctx.check_hostname)
+                self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_unverified_resolvconf_without_static_dns_ignores_gateway(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.conf'
+            path.write_text('[gateway]\ntls_verify=false\n')
+            config = config_module._parse_config(path)
+        self.assertEqual(client.gateway_tls_context(config).verify_mode, ssl.CERT_NONE)
+        self.assertEqual(client.select_session_dns(config, ['192.0.2.1']), [])
+
+    def test_unverified_resolvconf_uses_only_static_dns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.conf'
+            path.write_text('[gateway]\ntls_verify=false\n[dns]\nservers=192.0.2.2\n')
+            config = config_module._parse_config(path)
+        self.assertEqual(client.select_session_dns(config, ['192.0.2.1']), ['192.0.2.2'])
+
+    @patch('client.subprocess.run')
+    @patch('client._resolvconf_available', return_value=True)
+    @patch('dns_backend.routed_to_tunnel', side_effect=lambda ip, tun: str(ip) == '192.0.2.2')
+    def test_resolvconf_only_registers_dns_routed_via_tunnel(self, route, available, run):
+        run.return_value = subprocess.CompletedProcess([], 0)
+        client.setup_dns(['192.0.2.1'], 'resolvconf', 'tun-test')
+        run.assert_not_called()
+        client.setup_dns(['192.0.2.1', '192.0.2.2'], 'resolvconf', 'tun-test')
+        run.assert_called_once()
+        self.assertEqual(run.call_args.kwargs['input'], 'nameserver 192.0.2.2\n')
+
     @patch('client.restore_dns')
     @patch('client.run_vpn', side_effect=RuntimeError('session failed'))
     @patch('client.signal.signal')

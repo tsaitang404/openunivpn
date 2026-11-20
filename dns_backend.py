@@ -37,7 +37,7 @@ def routed_to_tunnel(ip, tun_name):
             and routes[0].get('type', 'unicast') == 'unicast')
 
 
-def activate(addresses, tun_name):
+def tunnel_dns_servers(addresses, tun_name):
     servers = []
     for address in addresses:
         try:
@@ -48,6 +48,11 @@ def activate(addresses, tun_name):
             continue
         if routed_to_tunnel(ip, tun_name):
             servers.append(ip)
+    return servers
+
+
+def activate(addresses, tun_name):
+    servers = tunnel_dns_servers(addresses, tun_name)
     if not servers:
         return False
     if not OFFLINE.is_file() or not ACTIVE.is_symlink() or Path(os.readlink(ACTIVE)) != OFFLINE:

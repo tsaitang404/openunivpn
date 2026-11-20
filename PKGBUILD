@@ -36,6 +36,8 @@ password =
 [gateway]
 # 格式: host:ip 或 host:port（缺省 443）
 list =
+# 默认校验 VPN 网关证书；仅在明确需要时设为 false。
+# tls_verify = true
 
 [tun]
 name = cnem0

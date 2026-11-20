@@ -271,7 +271,7 @@ def _resolvconf_available():
 
 
 def setup_dns(vpn_dns_list, backend='resolvconf', tun_name=None):
-    """将网关下发的 DNS 交给所选后端。"""
+    """将经隧道可达的 DNS 交给所选后端。"""
     if not vpn_dns_list:
         return
     if backend == 'dnsmasq':
@@ -287,13 +287,17 @@ def setup_dns(vpn_dns_list, backend='resolvconf', tun_name=None):
         logger.warning("openresolv(resolvconf) 未安装，跳过 VPN DNS 注入（不影响公网）")
         return
     try:
-        content = "\n".join(f"nameserver {d}" for d in vpn_dns_list) + "\n"
+        servers = dns_backend.tunnel_dns_servers(vpn_dns_list, tun_name)
+        if not servers:
+            logger.warning("没有可经 VPN 隧道路由的 DNS，保留系统 DNS")
+            return
+        content = "\n".join(f"nameserver {d}" for d in servers) + "\n"
         p = subprocess.run(
             ["resolvconf", "-a", RESOLVCONF_IFACE],
             input=content, capture_output=True, text=True,
         )
         if p.returncode == 0:
-            logger.info("VPN DNS 已通过 resolvconf 添加: %s", vpn_dns_list)
+            logger.info("VPN DNS 已通过 resolvconf 添加: %s", ', '.join(map(str, servers)))
         else:
             logger.warning("resolvconf 添加 DNS 失败: %s", p.stderr.strip())
     except Exception as e:
@@ -324,7 +328,7 @@ def restore_dns(backend='resolvconf'):
 
 
 def gateway_tls_context(config):
-    if config.get('tls_verify', config.get('dns_backend') == 'dnsmasq'):
+    if config.get('tls_verify', True):
         return ssl.create_default_context(cafile=config.get('gateway_ca') or None)
     context = ssl.create_default_context()
     context.check_hostname = False
@@ -333,10 +337,10 @@ def gateway_tls_context(config):
 
 
 def select_session_dns(config, advertised):
+    configured = config.get('dns_servers', [])
+    if not config.get('tls_verify', True):
+        return configured
     if config.get('dns_backend') == 'dnsmasq':
-        configured = config.get('dns_servers', [])
-        if not config.get('tls_verify', True):
-            return configured
         return configured or advertised
     return advertised
 
@@ -377,8 +381,8 @@ def main():
         print("    请编辑该文件后重试。")
         sys.exit(2)
 
-    if config.get('dns_backend') == 'dnsmasq' and not config.get('tls_verify', True):
-        logger.warning("VPN 网关 TLS 身份校验已禁用；仅使用管理员配置的 DNS 地址")
+    if not config.get('tls_verify', True):
+        logger.warning("VPN 网关 TLS 身份校验已禁用；不接受网关下发的 DNS")
     try:
         run_vpn(config, stop_event)
     finally:
