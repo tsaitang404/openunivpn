@@ -19,8 +19,7 @@ ExecStart=/usr/bin/python3 /opt/openunivpn/client.py
 Restart=on-failure
 RestartPreventExitStatus=78
 RestartSec=10
-# 清理 TUN 设备（"-" 前缀忽略失败；systemd 不支持 shell 重定向）
-ExecStopPost=-/usr/bin/ip link del cnem0
+# TUN 随 fd 释放；dnsmasq 仅恢复当前 INVOCATION_ID 持有的状态。
 ExecStopPost=-/usr/bin/python3 /opt/openunivpn/dns_backend.py
 # 安全加固（需写 /etc/resolv.conf 管理 VPN DNS，不能启用 ProtectSystem=full）
 PrivateTmp=true

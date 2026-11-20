@@ -1,10 +1,12 @@
 import os
 import ssl
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import client
 import config as config_module
@@ -74,6 +76,182 @@ class DnsmasqTest(unittest.TestCase):
             dns_backend.activate(['10.11.8.2'], 'tun-test')
         dns_backend.restore()
         reload.assert_not_called()
+
+    def backend_process(self, operation, invocation='', expected=0):
+        # Separate interpreter, real filesystem, no host DNS reload or route lookup.
+        script = '''
+import os, sys
+from pathlib import Path
+import dns_backend as db
+db.ACTIVE, db.OFFLINE = map(Path, sys.argv[1:3])
+db.routed_to_tunnel = lambda *args: True
+def reload():
+    with db.ACTIVE.with_name('reloads').open('a') as stream:
+        stream.write('offline\\n' if db.ACTIVE.is_symlink() else 'online\\n')
+db.reload_dnsmasq = reload
+''' + operation
+        result = subprocess.run([sys.executable, '-c', script, str(self.online), str(self.offline)],
+                                env={**os.environ, 'INVOCATION_ID': invocation},
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, expected, result.stderr)
+
+    def test_main_exception_does_not_restore_another_process_dns(self):
+        self.backend_process("db.activate(['10.11.8.2'], 'tun-test')")
+        config = dict(dns_backend='dnsmasq', gateways=[('vpn.invalid', 443)], username='test', password='test')
+        with patch('client.load_config', return_value=config), \
+             patch('client.os.geteuid', return_value=0), patch('client.signal.signal'), \
+             patch('client.run_vpn', side_effect=RuntimeError('session failed')), \
+             patch('dns_backend.reload_dnsmasq') as reload:
+            with self.assertRaisesRegex(RuntimeError, 'session failed'):
+                client.main()
+        self.assertFalse(self.online.is_symlink())
+        reload.assert_not_called()
+
+    def test_stop_post_recovers_only_matching_invocation_after_process_death(self):
+        owner, other = '1' * 32, '2' * 32
+        stop = 'db.restore_for_invocation()'
+        activate = "db.activate(['10.11.8.2'], 'tun-test')"
+        self.backend_process(stop, owner)  # Exited before any activation.
+        log = self.online.with_name('reloads')
+        self.assertFalse(log.exists())
+        self.backend_process(activate + '\nos._exit(42)', owner, expected=42)
+        self.backend_process(stop, other)
+        self.backend_process(stop)
+        self.assertFalse(self.online.is_symlink())
+        self.assertEqual(log.read_text(), 'online\n')
+        self.backend_process(stop, owner)
+        self.assertEqual(self.online.readlink(), self.offline)
+        self.backend_process(stop, owner)  # Idempotent after successful cleanup.
+        self.backend_process(activate)  # A subsequent manual instance.
+        self.backend_process(stop, owner)
+        self.assertFalse(self.online.is_symlink())
+        self.assertEqual(log.read_text(), 'online\noffline\nonline\n')
+
+    def test_stop_post_does_not_reload_if_process_died_before_replacing_file(self):
+        owner = '1' * 32
+        self.backend_process("db.replace_active = lambda *args: os._exit(42)\n"
+                             "db.activate(['10.11.8.2'], 'tun-test')", owner, expected=42)
+        self.backend_process('db.restore_for_invocation()', owner)
+        self.assertFalse(self.online.with_name('reloads').exists())
+        self.assertEqual(self.online.readlink(), self.offline)
+        self.backend_process("db.activate(['10.11.8.2'], 'tun-test')")  # Claim was released.
+
+    def test_stop_post_retries_reload_after_crash_during_rollback(self):
+        owner = '1' * 32
+        self.backend_process("db.activate(['10.11.8.2'], 'tun-test')\n"
+                             "db.reload_dnsmasq = lambda: os._exit(42)\n"
+                             "db.restore()", owner, expected=42)
+        self.assertEqual(self.online.readlink(), self.offline)
+        # A manual instance must not claim the offline symlink while rollback is pending.
+        self.backend_process("try:\n    db.activate(['10.11.8.3'], 'tun-test')\n"
+                             "except OSError:\n    sys.exit(42)", expected=42)
+        self.backend_process('db.restore_for_invocation()', owner)
+        self.assertEqual(self.online.with_name('reloads').read_text(), 'online\noffline\n')
+
+    def test_foreign_claim_stops_without_forwarding_or_retry(self):
+        self.backend_process("db.activate(['10.11.8.2'], 'tun-test')", '1' * 32)
+        self.check_ownership_conflict()
+
+    def test_stale_claim_after_failed_restore_stops_even_without_usable_dns(self):
+        self.backend_process("db.activate(['10.11.8.2'], 'tun-test')\n"
+                             "db.reload_dnsmasq = lambda: os._exit(42)\n"
+                             "db.restore()", '1' * 32, expected=42)
+        self.assertEqual(self.online.readlink(), self.offline)
+        self.route.return_value = False
+        self.check_ownership_conflict()
+
+    def test_unmarked_online_file_stops_new_session_without_adopting_it(self):
+        self.online.unlink()
+        self.online.write_text('server=10.11.8.2\n')  # v1.1.11 online state
+        self.backend_process('db.restore_for_invocation()', '1' * 32)
+        self.assertFalse(self.online.is_symlink())
+        self.assertFalse(self.online.with_name('reloads').exists())
+        self.check_ownership_conflict()
+
+    def check_ownership_conflict(self):
+        marker = self.online.with_name('servers.owner')
+
+        def snapshot(path):
+            if path.is_symlink():
+                return path.lstat().st_ino, path.readlink()
+            if path.exists():
+                return path.stat().st_ino, path.read_bytes()
+
+        before = snapshot(self.online), snapshot(marker)
+        config = dict(tun_name='tun-test', dns_backend='dnsmasq', gateways=[])
+        gateway = dict(ip='192.0.2.1', host='vpn.invalid', port=443, latency=1)
+        vip = dict(vip_ip='198.51.100.9', mask='255.255.255.224', routes=[], dns=['198.51.100.17'])
+        stop = Mock(wraps=threading.Event())
+        stop.wait.return_value = True
+        ready = Mock()
+        run_session = client._run_session
+        with patch.object(client, 'select_gateway', return_value=[gateway, {**gateway, 'ip': '192.0.2.2'}]) as select, \
+             patch.object(client, 'authenticate', return_value=2) as auth, \
+             patch.object(client, 'open_gateway_tls', return_value=Mock()), \
+             patch.object(client, 'negotiate', return_value=vip), \
+             patch.object(client, 'create_tun', return_value=(42, 'tun-test')), \
+             patch.object(client.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='[]')), \
+             patch.object(client.os, 'close') as close, \
+             patch.object(client, '_run_session', side_effect=lambda c, ctx, s, gw, _: run_session(c, ctx, s, gw, ready)), \
+             patch.object(client, '_forward', side_effect=lambda *_: stop.set()) as forward, \
+             patch.object(client, 'restore_dns') as restore, \
+             patch.object(dns_backend, 'reload_dnsmasq') as reload, \
+             self.assertLogs('openunivpn') as logs:
+            self.assertEqual(client.run_vpn(config, stop), 78)
+        self.assertIn('所有权冲突', '\n'.join(logs.output))
+        select.assert_called_once()
+        auth.assert_called_once()
+        close.assert_called_once_with(42)
+        ready.assert_not_called()
+        forward.assert_not_called()
+        stop.wait.assert_not_called()
+        restore.assert_not_called()
+        reload.assert_not_called()
+        self.assertEqual((snapshot(self.online), snapshot(marker)), before)
+
+    def test_dnsmasq_restores_before_tun_close_on_disconnect_and_reconnect(self):
+        actions = []
+
+        def ip_run(args, **kwargs):
+            if args[:4] == ['ip', 'route', 'add', '203.0.113.0/24']:
+                actions.append('DNS route added')
+            return subprocess.CompletedProcess(args, 0, stdout='[]')
+
+        def reload():
+            actions.append('offline' if self.online.is_symlink() else 'online')
+
+        real_close = os.close
+
+        def close(fd):
+            if fd in (42, 43):
+                actions.append(fd)
+            else:
+                real_close(fd)
+
+        config = dict(tun_name='tun-test', dns_backend='dnsmasq', extra_routes=['203.0.113.0/24'])
+        gateway = dict(ip='192.0.2.1', host='vpn.invalid', port=443, latency=1)
+        vip = dict(vip_ip='198.51.100.9', mask='255.255.255.224', routes=[], dns=['203.0.113.53'])
+        transient = client.SessionFailure('转发', '断开', retryable=True)
+        with patch.object(client, 'authenticate', return_value=2), \
+             patch.object(client, 'open_gateway_tls', return_value=Mock()), \
+             patch.object(client, 'negotiate', return_value=vip), \
+             patch.object(client, 'create_tun', side_effect=[(42, 'tun-test'), (43, 'tun-test')]), \
+             patch.object(client.subprocess, 'run', side_effect=ip_run), \
+             patch.object(client.os, 'close', side_effect=close), \
+             patch.object(dns_backend, 'reload_dnsmasq', side_effect=reload), \
+             patch.object(client, '_forward', side_effect=[transient, None]):
+            def connect():
+                client._run_session(config, None, threading.Event(), gateway, lambda: actions.append('ready'))
+
+            with self.assertRaises(client.SessionFailure) as raised:
+                connect()
+            self.assertIs(raised.exception, transient)
+            self.assertEqual(self.online.readlink(), self.offline)
+            connect()
+            self.assertEqual(self.online.readlink(), self.offline)
+
+        self.assertEqual(actions, ['DNS route added', 'online', 'ready', 'offline', 42,
+                                   'DNS route added', 'online', 'ready', 'offline', 43])
 
 
 class GatewayTrustTest(unittest.TestCase):
@@ -150,7 +328,7 @@ class GatewayTrustTest(unittest.TestCase):
         run.assert_called_once()
         self.assertEqual(run.call_args.kwargs['input'], 'nameserver 192.0.2.2\n')
 
-    @patch('client.restore_dns')
+    @patch('dns_backend.restore')
     @patch('client.run_vpn', side_effect=RuntimeError('session failed'))
     @patch('client.signal.signal')
     @patch('client.os.geteuid', return_value=0)
@@ -162,4 +340,4 @@ class GatewayTrustTest(unittest.TestCase):
         restore.side_effect = OSError('restore failed')
         with self.assertLogs('openunivpn', level='ERROR'), self.assertRaisesRegex(RuntimeError, 'session failed'):
             client.main()
-        restore.assert_called_once_with('dnsmasq')
+        restore.assert_called_once_with()

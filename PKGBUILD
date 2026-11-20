@@ -41,6 +41,8 @@ list =
 
 [tun]
 name = cnem0
+# 可选：逗号分隔的 IPv4 CIDR；留空只使用协商网段及网关下发路由。
+extra_routes =
 
 [dns]
 backend = resolvconf

@@ -2,7 +2,6 @@
 from contextlib import ExitStack
 from pathlib import Path
 import errno
-import json
 import os
 import socket
 import ssl
@@ -20,6 +19,9 @@ import config
 CONFIG = dict(gateways=[('one.invalid', 443)], tun_name='test0',
               username='test-user', password='test-pass')
 REAL_CLOSE = os.close
+VIP_IP, VIP_MASK = '198.51.100.9', '255.255.255.224'
+VIP = dict(vip_ip=VIP_IP, mask=VIP_MASK, routes=[], dns=[])
+NETCFG = socket.inet_aton(VIP_IP) + socket.inet_aton(VIP_MASK)
 
 
 class RetryTests(unittest.TestCase):
@@ -89,7 +91,7 @@ class SessionTests(unittest.TestCase):
         self.wrap = self.tls.return_value.wrap_socket
         self.tun = stack.enter_context(patch('client.create_tun', return_value=(42, 'test0')))
         self.cmd = stack.enter_context(patch('client.subprocess.run', side_effect=lambda args, **_:
-                                             subprocess.CompletedProcess(args, 0)))
+                                             subprocess.CompletedProcess(args, 0, stdout='[]')))
         self.close_fd = stack.enter_context(patch('client.os.close'))
         stack.enter_context(patch('client._resolvconf_available', return_value=True))
         self.dns_route = stack.enter_context(patch('dns_backend.routed_to_tunnel', return_value=True))
@@ -105,7 +107,7 @@ class SessionTests(unittest.TestCase):
         self.ready = Mock()
         gateway = self.gateway['fast.invalid']
         with patch('client.authenticate', return_value=2), \
-             patch('client.negotiate', return_value=dict(vip_ip='192.0.2.3', routes=[], dns=[]) | vip):
+             patch('client.negotiate', return_value=VIP | vip):
             client._run_session(self.config, self.tls.return_value, self.stop, gateway, self.ready)
         return self.ready
 
@@ -114,32 +116,17 @@ class SessionTests(unittest.TestCase):
             with self.subTest(failed=failed):
                 self.close_fd.reset_mock()
                 self.cmd.side_effect = lambda args, **_: subprocess.CompletedProcess(
-                    args, 2 if failed in args else 0, stdout='[]', stderr='failed')
+                    args, 2 if failed in args and 'show' not in args else 0, stdout='[]', stderr='failed')
                 with patch('client.authenticate', return_value=2) as auth, \
-                     patch('client.negotiate', return_value=dict(vip_ip='192.0.2.3', routes=[], dns=[])):
+                     patch('client.negotiate', return_value=VIP):
                     self.assertEqual(self.run_vpn(), 78)
                 auth.assert_called_once()
                 self.forward.assert_not_called()
                 self.close_fd.assert_called_once_with(42)
 
-    def test_existing_route_only_accepted_when_equivalent(self):
-        def run(args, **kwargs):
-            if args[:3] == ['ip', 'route', 'add'] and args[3] == '10.11.0.0/16':
-                return subprocess.CompletedProcess(args, 2, stderr='File exists')
-            return subprocess.CompletedProcess(args, 0, stdout=json.dumps([existing]))
-
-        self.cmd.side_effect = run
-        existing = dict(dst='10.11.0.0/16', dev='other0', scope='link')
-        with self.assertRaises(client.SessionFailure):
-            self.run_with_netcfg()
-        self.forward.assert_not_called()
-        existing['dev'] = 'test0'
-        self.run_with_netcfg(routes=[('10.11.0.0', '255.255.0.0')]).assert_called_once()
-        self.forward.assert_called_once()
-
     def run_dns_session(self):
         with patch('client.authenticate', return_value=2) as auth, \
-             patch('client.negotiate', return_value=dict(vip_ip='192.0.2.3', routes=[], dns=['192.0.2.53'])), \
+             patch('client.negotiate', return_value=VIP | dict(dns=['198.51.100.17'])), \
              patch('client.select_gateway', return_value=list(self.gateway.values())) as select:
             result = self.run_vpn()
         select.assert_called_once()
@@ -160,7 +147,7 @@ class SessionTests(unittest.TestCase):
                 actions.append(args[1])
                 return subprocess.CompletedProcess(args, add_status if args[1] == '-a' else 1,
                                                    stderr='failed')
-            return subprocess.CompletedProcess(args, 0)
+            return subprocess.CompletedProcess(args, 0, stdout='[]')
         self.cmd.side_effect = run
         self.close_fd.side_effect = lambda *_: actions.append('close TUN')
         self.forward.side_effect = client.SessionFailure('TLS', 'transient', retryable=True)
@@ -218,7 +205,7 @@ class SessionTests(unittest.TestCase):
         auth, cn = Mock(), Mock()
         auth.recv.side_effect = [b'\xf0\xf0', b'\xf0\xf0\x00\x00\x00\x02']
         acl = client.cnem_frame(client.CMD_ACL)
-        netcfg = bytes(160) + socket.inet_aton('192.0.2.53')
+        netcfg = NETCFG.ljust(160, b'\0') + socket.inet_aton('198.51.100.17')
         cn.recv.side_effect = [acl[:7], acl[7:], client.cnem_frame(client.CMD_REQVIP, netcfg),
                                socket.timeout(), socket.timeout()]
         self.connect.side_effect = [OSError(errno.ENETUNREACH, 'offline'), raw, raw]
@@ -240,7 +227,7 @@ class SessionTests(unittest.TestCase):
         auth.recv.return_value = b'\xf0' * 4 + client.be32(2)
         # ACL responses use a little-endian payload size.
         acl = client.cnem_frame(client.CMD_ACL)[:14] + b'\x14\x00' + bytes(20)
-        reply = client.cnem_frame(client.CMD_REQVIP, bytes(30))
+        reply = client.cnem_frame(client.CMD_REQVIP, NETCFG.ljust(30, b'\0'))
         cn.recv.side_effect = [bytes([byte]) for byte in acl + reply] + [socket.timeout()] * 2
         self.stop.wait.return_value = True
         self.stop.wait.side_effect = [False, False, True]
@@ -325,7 +312,7 @@ class SessionTests(unittest.TestCase):
         self.wrap.side_effect = [auth, cn]
         auth.recv.return_value = b'\xf0' * 4 + b'\x00\x00\x00\x02'
         cn.recv.side_effect = [client.cnem_frame(client.CMD_ACL),
-                               client.cnem_frame(client.CMD_REQVIP, bytes(30)),
+                               client.cnem_frame(client.CMD_REQVIP, NETCFG.ljust(30, b'\0')),
                                socket.timeout(), socket.timeout()]
         self.forward.side_effect = client.SessionFailure('转发', '关闭', retryable=True)
         self.stop.wait.side_effect = [False, False, False, False, True]
@@ -404,7 +391,7 @@ class SessionTests(unittest.TestCase):
         packet = b'\x45\x00\x00\x14' + bytes(16)
         ack = client.cnem_frame(client.CMD_DATA_CONNECT, client.be32(4))
         cn.recv.side_effect = [client.cnem_frame(client.CMD_ACL),
-                               client.cnem_frame(client.CMD_REQVIP, bytes(30)),
+                               client.cnem_frame(client.CMD_REQVIP, NETCFG.ljust(30, b'\0')),
                                socket.timeout(),
                                ack + client.cnem_frame(client.CMD_DATA, packet)
                                + client.cnem_frame(client.CMD_KICKOUT)]
@@ -420,7 +407,7 @@ class SessionTests(unittest.TestCase):
         auth.recv.return_value = b'\xf0' * 4 + client.be32(2)
         packet = b'\x45\x00\x00\x24' + client.cnem_frame(client.CMD_KICKOUT) + bytes(16)
         cn.recv.side_effect = [client.cnem_frame(client.CMD_ACL),
-                               client.cnem_frame(client.CMD_REQVIP, bytes(30)),
+                               client.cnem_frame(client.CMD_REQVIP, NETCFG.ljust(30, b'\0')),
                                client.cnem_frame(client.CMD_DATA, packet), socket.timeout()]
         self.assertEqual(self.run_vpn(), 0)
         stream = self.forward.call_args.args[1]

@@ -7,11 +7,12 @@ UniVPN 开源客户端 — 自动选最优网关 + TUN 模式
   2. dae 分流内网段到 cnem0 / 浏览器直接访问内网 IP
 """
 import socket, ssl, struct, sys, os, time, threading, select, random, fcntl, subprocess, ipaddress, logging, signal, shutil, errno, json
+import re
 from contextlib import closing, contextmanager
 from configparser import Error as ConfigError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Tuple
-from config import load_config, _find_config
+from config import load_config, _find_config, parse_extra_route
 import dns_backend
 
 logger = logging.getLogger('openunivpn')
@@ -176,19 +177,17 @@ def parse_netcfg(payload):
     if not vip["dns"]:
         logger.warning("未能从 REQVIP 响应解析出 DNS（偏移可能已漂移）")
 
-    # 路由表：@188 开始，每条 12B，数量由 @184 给出
+    # 路由表：@188 开始，每条 12B，数量由 @186 给出。
     if NETCFG_RT_COUNT_OFF + 2 <= len(payload):
         route_count = struct.unpack(">H", payload[NETCFG_RT_COUNT_OFF:NETCFG_RT_COUNT_OFF + 2])[0]
-        off = NETCFG_RT_START
-        for _ in range(route_count):
-            if off + 8 > len(payload):
-                break
+        end = NETCFG_RT_START + route_count * NETCFG_RT_STRIDE
+        if end > len(payload):
+            logger.warning("REQVIP 路由表截断")
+            return None
+        for off in range(NETCFG_RT_START, end, NETCFG_RT_STRIDE):
             net_b = payload[off:off + 4]
             mask_b = payload[off + 4:off + 8]
-            if net_b == b"\x00\x00\x00\x00" and mask_b == b"\x00\x00\x00\x00":
-                break
             vip["routes"].append((_parse_ip(net_b), _parse_ip(mask_b)))
-            off += NETCFG_RT_STRIDE
 
     logger.info("REQVIP 解析: VIP=%s mask=%s DNS=%s routes=%d",
                 vip["vip_ip"], vip["mask"], vip["dns"], len(vip["routes"]))
@@ -251,12 +250,16 @@ def select_gateway(ctx1f4, gateways):
 
 def create_tun(name="cnem0"):
     TUNSETIFF = 0x400454CA
-    ifr = struct.pack("16sH", name.encode(), 0x0001 | 0x1000)
+    IFF_TUN, IFF_NO_PI, IFF_TUN_EXCL = 0x0001, 0x1000, 0x8000
+    if not re.fullmatch(r'[A-Za-z0-9_.-]{1,15}', name) or name in ('.', '..') or name.startswith('-'):
+        raise SessionFailure('TUN 配置', '无效的 TUN 接口名称')
+    # Kernel exclusivity prevents attaching to a persistent or concurrently created TUN.
+    ifr = struct.pack("16sH22x", name.encode('ascii'), IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL)
     fd = os.open("/dev/net/tun", os.O_RDWR)
     try:
         fcntl.ioctl(fd, TUNSETIFF, ifr)
     except BaseException:
-        os.close(fd)
+        close_resource(os.close, fd)
         raise
     return fd, name
 
@@ -267,30 +270,57 @@ def run_cmd(args):
         raise SessionFailure("TUN 配置", f"ip {args[1]} {args[2]} 失败（退出码 {result.returncode}）")
 
 
-def add_tun_route(prefix, tun_name):
+def negotiated_network(address, mask):
+    network = ipaddress.IPv4Network(f'{address}/{mask}', strict=False)
+    # ipaddress also accepts wildcard/host masks and numeric prefix lengths.
+    if str(network.netmask) != mask:
+        raise ValueError('invalid IPv4 netmask')
+    return network
+
+
+def implicit_broadcast_routes(network):
+    # noprefixroute doesn't suppress local broadcast routes. Older Linux also
+    # treats the subnet's first IP as a broadcast; /31 and /32 have neither.
+    if network.prefixlen < 31:
+        return (ipaddress.IPv4Network(network.broadcast_address),
+                ipaddress.IPv4Network(network.network_address))
+    return ()
+
+
+def plan_tun(vip, extra_routes, gateway_ip):
     try:
-        run_cmd(["ip", "route", "add", prefix, "dev", tun_name])
-    except SessionFailure:
-        # A connected route or overlapping advertised/static entries can
-        # already supply this exact direct route. Never replace other routes.
-        network = ipaddress.IPv4Network(prefix, strict=False)
-        dst = 'default' if network.prefixlen == 0 else (
-            str(network.network_address) if network.prefixlen == 32 else str(network)
-        )
-        result = subprocess.run(["ip", "-j", "route", "show", "table", "main", "exact", str(network)],
-                                capture_output=True, text=True)
-        if result.returncode == 0:
-            try:
-                routes = json.loads(result.stdout)
-            except ValueError:
-                routes = []
-            if any(r.get('dst') in (dst, str(network)) and r.get('dev') == tun_name
-                   and r.get('type', 'unicast') == 'unicast' and r.get('scope') == 'link'
-                   and not r.get('metric', 0) and not r.get('tos', 0)
-                   and not {'gateway', 'via', 'nexthops', 'nhid', 'encap'} & r.keys()
-                   for r in routes):
-                return
-        raise
+        address = ipaddress.IPv4Address(vip['vip_ip'])
+        if address.is_unspecified or address.is_loopback or address.is_multicast or int(address) == 0xffffffff:
+            raise ValueError('invalid VIP')
+        connected = negotiated_network(address, vip.get('mask'))
+        routes = [connected]
+        routes.extend(negotiated_network(net, mask) for net, mask in vip['routes'])
+        routes.extend(parse_extra_route(route) for route in extra_routes)
+        # Match the actual IPv4 endpoint, including literal forms inet_aton accepts.
+        gateway = ipaddress.IPv4Address(socket.inet_aton(gateway_ip))
+    except (ValueError, OSError) as exc:
+        raise SessionFailure('TUN 配置', '无效的 IPv4 地址、掩码或路由') from exc
+    if any(route.prefixlen == 0 or gateway in route for route in routes):
+        raise SessionFailure('TUN 配置', '路由计划包含默认路由或覆盖当前 VPN 网关')
+    for prefix in implicit_broadcast_routes(connected):
+        if prefix in routes:
+            raise SessionFailure('TUN 配置', f'IPv4 路由与隐式广播路由冲突：{prefix}')
+    return ipaddress.IPv4Interface(f'{address}/{connected.prefixlen}'), tuple(dict.fromkeys(routes))
+
+
+def check_route_conflicts(address, routes):
+    implicit = (ipaddress.IPv4Network(address.ip), *implicit_broadcast_routes(address.network))
+    for prefix in dict.fromkeys((*implicit, *routes)):
+        result = subprocess.run(['ip', '-j', '-4', 'route', 'show', 'table', 'all', 'exact', str(prefix)],
+                                capture_output=True, text=True, timeout=5)
+        try:
+            entries = json.loads(result.stdout) if result.returncode == 0 else None
+        except (ValueError, TypeError):
+            entries = None
+        if not isinstance(entries, list):
+            raise SessionFailure('TUN 配置', '无法检查现有 IPv4 路由')
+        if entries:
+            raise SessionFailure('TUN 配置', f'IPv4 路由冲突：{prefix}')
 
 
 # ── 系统 DNS 管理（通过 openresolv/resolvconf 协调，与 NetworkManager 共存）──
@@ -306,13 +336,13 @@ def _resolvconf_available():
 
 def setup_dns(vpn_dns_list, backend='resolvconf', tun_name=None, *, before_change=None):
     """将经隧道可达的 DNS 交给所选后端。"""
-    if not vpn_dns_list:
-        return
     if backend == 'dnsmasq':
         if dns_backend.activate(vpn_dns_list, tun_name, before_change=before_change):
             logger.info("dnsmasq 已切换为 VPN DNS: %s", vpn_dns_list)
-        else:
+        elif vpn_dns_list:
             logger.warning("没有可经 VPN 隧道路由的 DNS，保留原上游")
+        return
+    if not vpn_dns_list:
         return
     if not _resolvconf_available():
         logger.warning("openresolv(resolvconf) 未安装，跳过 VPN DNS 注入（不影响公网）")
@@ -332,7 +362,7 @@ def setup_dns(vpn_dns_list, backend='resolvconf', tun_name=None, *, before_chang
 def restore_dns(backend='resolvconf'):
     """Restore a backend whose state may have changed; propagate failures."""
     if backend == 'dnsmasq':
-        dns_backend.restore(required=True)
+        dns_backend.restore()
         return
     subprocess.run(["resolvconf", "-d", RESOLVCONF_IFACE],
                    capture_output=True, text=True).check_returncode()
@@ -351,6 +381,8 @@ def session_dns(addresses, backend, tun_name):
     try:
         try:
             setup_dns(addresses, backend, tun_name, before_change=before_change)
+        except dns_backend.OwnershipConflict as exc:
+            raise SessionFailure("DNS 配置", "dnsmasq 所有权冲突；请确认离线上游已恢复后再启动") from exc
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             if changed:
                 raise SessionFailure("DNS 配置", f"切换 {backend} DNS 失败（{type(exc).__name__}）") from exc
@@ -454,7 +486,7 @@ def main():
         return result
     except BaseException:
         # Last resort for an unexpected process-level failure. Normal session
-        # cleanup runs before the TUN closes and handles the retry decision.
+        # cleanup runs before the TUN closes. dnsmasq only restores our claim.
         if config.get('dns_backend') == 'dnsmasq':
             try:
                 restore_dns('dnsmasq')
@@ -742,15 +774,18 @@ def _run_session(config, context, stop_event, gw, on_ready):
         if vip is None or stop_event.is_set():
             return
         backend = config.get('dns_backend', 'resolvconf')
+        address, routes = plan_tun(vip, config.get('extra_routes', ()), gw['ip'])
+        check_route_conflicts(address, routes)
+        if stop_event.is_set():
+            return
         tun_fd, tun_name = create_tun(config['tun_name'])
         try:
-            run_cmd(["ip", "link", "set", tun_name, "up"])
-            run_cmd(["ip", "addr", "add", f"{vip['vip_ip']}/24", "dev", tun_name])
-            for net, mask in vip['routes']:
-                prefix = ipaddress.IPv4Network(f"{net}/{mask}", strict=False).prefixlen
-                add_tun_route(f"{net}/{prefix}", tun_name)
-            for subnet in ["10.11.0.0/16", "10.12.0.0/16", "10.13.0.0/16"]:
-                add_tun_route(subnet, tun_name)
+            run_cmd(["ip", "link", "set", "dev", tun_name, "up"])
+            run_cmd(["ip", "addr", "add", str(address), "dev", tun_name, "noprefixroute"])
+            for route in routes:
+                run_cmd(["ip", "route", "add", str(route), "dev", tun_name])
+            if stop_event.is_set():
+                return
             dns = select_session_dns(config, vip['dns'])
             with session_dns(dns, backend, tun_name):
                 on_ready()

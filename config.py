@@ -31,6 +31,19 @@ def _find_config():
     return None
 
 
+def parse_extra_route(route):
+    _, sep, prefix = route.partition('/')
+    try:
+        if not (sep and prefix.isascii() and prefix.isdecimal()):
+            raise ValueError
+        network = ipaddress.IPv4Network(route)
+        if network.prefixlen == 0:
+            raise ValueError
+    except ValueError:
+        raise ValueError('[tun] extra_routes requires non-default IPv4 network CIDRs') from None
+    return network
+
+
 def _parse_config(path):
     """解析 INI 格式配置文件"""
     c = configparser.RawConfigParser()
@@ -69,11 +82,14 @@ def _parse_config(path):
                 raise ValueError('[gateway] list port must be in 1..65535')
             gateways.append((addr, port))
 
+    extra_routes = [str(parse_extra_route(raw.strip()))
+                    for raw in c.get('tun', 'extra_routes', fallback='').split(',') if raw.strip()]
     return {
         'username': c.get('auth', 'username', fallback=''),
         'password': c.get('auth', 'password', fallback=''),
         'gateways': gateways,
         'tun_name': c.get('tun', 'name', fallback='cnem0'),
+        'extra_routes': extra_routes,
         'dns_backend': dns_backend,
         'dns_servers': dns_servers,
         'tls_verify': tls_verify,
@@ -85,7 +101,7 @@ def load_config():
     path = _find_config()
     if path:
         return _parse_config(path)
-    return {'username': '', 'password': '', 'gateways': [], 'tun_name': 'cnem0'}
+    return {'username': '', 'password': '', 'gateways': [], 'tun_name': 'cnem0', 'extra_routes': []}
 
 
 def setup_wizard():
