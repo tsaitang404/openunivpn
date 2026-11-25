@@ -224,3 +224,26 @@ class RouteConfigTests(unittest.TestCase):
         for route in ('0.0.0.0/0', '::/1', '203.0.113.4', '203.0.113.4/24', '203.0.113.0/0.0.0.255'):
             with self.subTest(route=route), self.assertRaisesRegex(ValueError, 'extra_routes'):
                 self.parse(route)
+
+    def test_gateway_list_uses_host_and_optional_port(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'test.conf'
+            path.write_text('[gateway]\nlist = vpn.example.com, backup.example.com:8443\n')
+            parsed = config._parse_config(path)
+        self.assertEqual(parsed['gateways'], [('vpn.example.com', 443), ('backup.example.com', 8443)])
+
+    def test_gateway_list_rejects_non_numeric_port(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'test.conf'
+            path.write_text('[gateway]\nlist = vpn.example.com:1.2.3.4\n')
+            with self.assertRaisesRegex(ValueError, 'numeric port'):
+                config._parse_config(path)
+
+    def test_mac_address_is_normalized_or_derived(self):
+        self.assertEqual(config.parse_mac_address('aa:bb:cc:dd:ee:ff'), 'AA-BB-CC-DD-EE-FF')
+        with patch.object(config.uuid, 'getnode', return_value=0x010203040506):
+            self.assertEqual(config.parse_mac_address(''), '01-02-03-04-05-06')
+
+    def test_mac_address_rejects_invalid_value(self):
+        with self.assertRaisesRegex(ValueError, 'mac_address'):
+            config.parse_mac_address('not-a-mac')

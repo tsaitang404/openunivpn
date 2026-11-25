@@ -326,7 +326,17 @@ class GatewayTrustTest(unittest.TestCase):
         run.assert_not_called()
         client.setup_dns(['192.0.2.1', '192.0.2.2'], 'resolvconf', 'tun-test')
         run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], ['resolvconf', '-a', 'vpn-openunivpn'])
         self.assertEqual(run.call_args.kwargs['input'], 'nameserver 192.0.2.2\n')
+
+    @patch('client.subprocess.run')
+    @patch('dns_backend.routed_to_tunnel', return_value=True)
+    def test_resolvconf_label_is_configurable(self, route, run):
+        run.return_value = subprocess.CompletedProcess([], 0)
+        client.setup_dns(['192.0.2.2'], 'resolvconf', 'tun-test', 'vpn-work')
+        self.assertEqual(run.call_args.args[0], ['resolvconf', '-a', 'vpn-work'])
+        client.restore_dns('resolvconf', 'vpn-work')
+        self.assertEqual(run.call_args.args[0], ['resolvconf', '-d', 'vpn-work'])
 
     @patch('dns_backend.restore')
     @patch('client.run_vpn', side_effect=RuntimeError('session failed'))

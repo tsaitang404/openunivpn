@@ -24,6 +24,24 @@ VIP = dict(vip_ip=VIP_IP, mask=VIP_MASK, routes=[], dns=[])
 NETCFG = socket.inet_aton(VIP_IP) + socket.inet_aton(VIP_MASK)
 
 
+class AuthenticationTests(unittest.TestCase):
+    @patch('client.open_gateway_tls')
+    def test_authentication_query_encodes_credentials(self, open_tls):
+        sock = Mock()
+        sock.recv.return_value = b'\xf0' * 4 + b'\x00\x00\x00\x02'
+        open_tls.return_value = sock
+        config = {'username': 'user&name', 'password': 'p a+s&%=/?#',
+                  'mac_address': 'AA-BB-CC-DD-EE-FF'}
+        gateway = {'host': 'vpn.example.com', 'ip': '192.0.2.1', 'port': 443}
+
+        self.assertEqual(client.authenticate(config, Mock(), gateway), 2)
+
+        request = sock.sendall.call_args.args[0].decode('ascii')
+        self.assertIn('UserName=user%26name', request)
+        self.assertIn('Password=p+a%2Bs%26%25%3D%2F%3F%23', request)
+        self.assertIn('MacAddress=AA-BB-CC-DD-EE-FF', request)
+
+
 class RetryTests(unittest.TestCase):
     def test_long_outage_reprobes_until_recovery(self):
         stop = Mock(wraps=threading.Event())
